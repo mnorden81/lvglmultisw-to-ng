@@ -87,6 +87,8 @@ function getSwitchName(i)
     return nil
 end
 collectgarbage = function() return 0 end -- not implemented in fengari
+-- EdgeTX strings have no methods ("x"):sub(): remove them like on the radio
+getmetatable("").__index = nil
 local function screen() return table.concat(SCREEN, "\n") end
 local function has(s) return string.find(screen(), s, 1, true) ~= nil end
 
