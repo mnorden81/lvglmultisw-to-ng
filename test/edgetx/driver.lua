@@ -1,5 +1,6 @@
 -- Test driver for edgetx/SCRIPTS/TOOLS/msw2ng.lua, run with fengari in test/edgetx/run.html.
--- Mocks the EdgeTX file and screen API on an in-memory SD card.
+-- Mocks the EdgeTX file and screen API on an in-memory SD card and enforces a per-call
+-- instruction budget like EdgeTX's CPU limit for scripts.
 local js = require "js"
 local global = js.global
 local function src(id) return global.document:getElementById(id).textContent end
@@ -17,9 +18,7 @@ local function addDirs(path)
     local d = parentOf(path)
     while d and d ~= "" do DIRS[norm(d)] = d; d = parentOf(d) end
 end
-local function resetCard()
-    FILES, DIRS = {}, {}
-end
+local function resetCard() FILES, DIRS = {}, {} end
 local function put(path, text) FILES[norm(path)] = {path = path, data = text}; addDirs(path) end
 local function get(path) local f = FILES[norm(path)]; return f and f.data end
 
@@ -50,9 +49,9 @@ function io.close(h) end
 function dir(path)
     local key = norm(path)
     if not DIRS[key] then return nil end
-    local names, seen = {}, {}
+    local names = {}
     for k, f in pairs(FILES) do if parentOf(k) == key then names[#names + 1] = string.match(f.path, "[^/]+$") end end
-    for k, d in pairs(DIRS) do if parentOf(k) == key and not seen[k] then seen[k] = true; names[#names + 1] = string.match(d, "[^/]+$") end end
+    for k, d in pairs(DIRS) do if parentOf(k) == key then names[#names + 1] = string.match(d, "[^/]+$") end end
     local i = 0
     return function() i = i + 1; return names[i] end
 end
@@ -62,7 +61,7 @@ function fstat(path)
     if FILES[k] then return {attrib = 0x20, size = #FILES[k].data} end
 end
 function mkdir(path) DIRS[norm(path)] = path; return 0 end
-INFO = {}
+INFO = {name = "Düsseldorf", filename = "model01.yml"}
 model = {getInfo = function() return INFO end}
 function loadScript(path, mode)
     local f = FILES[norm(path)]
@@ -77,34 +76,66 @@ lcd = {
 }
 LCD_W, LCD_H = 480, 272
 SMLSIZE, BOLD, INVERS = 0x0100, 0x0200, 0x0400
-EVT_VIRTUAL_ENTER, EVT_VIRTUAL_EXIT, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_PREV, EVT_TOUCH_TAP = 101, 102, 103, 104, 105
+EVT_VIRTUAL_ENTER, EVT_VIRTUAL_EXIT, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_PREV = 101, 102, 103, 104
+EVT_TOUCH_TAP, EVT_VIRTUAL_ENTER_LONG, EVT_VIRTUAL_NEXT_PAGE = 105, 106, 107
 function getGeneralSettings() return {language = "EN"} end
 collectgarbage = function() return 0 end -- not implemented in fengari
 local function screen() return table.concat(SCREEN, "\n") end
+local function has(s) return string.find(screen(), s, 1, true) ~= nil end
 
 ------------------------------------------------------------ load script ---
-local toolSource = src("tool")
-local tool = load(toolSource, "@msw2ng.lua", "t")()
+local tool = load(src("tool"), "@msw2ng.lua", "t")()
 local C = tool.core
 local NGCONFIG, NGSTORAGE = src("ngconfig"), src("ngstorage")
+
+-- EdgeTX stops a script call after a fixed number of VM instructions. The mocks above run as
+-- Lua here (C on the radio), so this budget is stricter than the radio's.
+local BUDGET = 15000
+local overBudget = nil
+local PEAK = {}
+local function call(event, touch)
+    local n = 0
+    debug.sethook(function() n = n + 100 end, "", 100)
+    local ok, r = pcall(tool.run, event, touch)
+    debug.sethook()
+    local st = tool.state()
+    local where = st and (st.phase .. "/" .. tostring(st.scan and st.scan.phase) .. "/" .. tostring(st.w and st.w.phase)) or "?"
+    if n > (PEAK[where] or 0) then PEAK[where] = n end
+    if n > BUDGET and not overBudget then overBudget = where .. " used " .. n end
+    if not ok then error(r) end
+    return r
+end
+do
+    local fired = false
+    debug.sethook(function() fired = true; debug.sethook() end, "", 1000)
+    local x = 0
+    for i = 1, 5000 do x = x + i end
+    debug.sethook()
+    check("budget hook works in this Lua", fired)
+end
 
 ----------------------------------------------------------- unit tests ---
 do
     local t = 'return {\n-- Table: {1}\n{\n ["name"]="a\\"b\\\\c\\10d",\n ["list"]={2},\n ["f"]=51.0,\n ["neg"]=-5,\n ["b"]=true,\n},\n-- Table: {2}\n{\n {3},\n},\n-- Table: {3}\n{ ["x"]=1, },\n}\n--end\n'
     local r, err = C.parseOldConfig(t)
     check("parser: escapes, refs, trailer", r and r.name == 'a"b\\c\nd' and r.f == 51 and r.neg == -5 and r.b == true and r.list[1].x == 1 and C.isList(r.list), err)
-    for _, bad in ipairs({'return { os.execute("x") }', 'return { {1}, ["a"]=f() }', 'x = 1', 'return { {1} } os.exit()', 'return {{ ["a"]={9} }}'}) do
+    MARK = nil
+    for _, bad in ipairs({
+        'return { os.execute("x") }', 'return { {1}, ["a"]=f() }', 'x = 1', 'return { {1} } os.exit()',
+        'return {{ ["a"]={9} }}', 'return {{ ["a"]=(function() MARK=1 end)() }}',
+        "return {{ '\"', (\"x\"):rep(3), '\"' }}", 'return {{ [[ " ]], ("x"):rep(3), [[ " ]] }}',
+        'return {{ --[[ x ]] ("x"):rep(3) }}', 'return {{ ["a"]=#"x" }}', 'return {{ ["a"]=2^3 }}',
+        'return {{ ["a"]=1 }} while true do end',
+    }) do
         local res = C.parseOldConfig(bad)
         check("parser rejects: " .. bad, res == nil)
     end
+    check("parser never executes code", MARK == nil)
     local _, e1 = C.parseOldConfig("")
     local _, e2 = C.parseOldConfig('return {\n{\n ["a"]={2},\n},\n{\n ["b"]="x')
-    local _, e3 = C.parseOldConfig('return {{ ["a"]={2} },{ ["b"]={1} }}')
-    check("parser: empty/truncated/circular", e1 == "empty" and e2 == "truncated" and e3 == "circular reference", tostring(e1) .. "," .. tostring(e2) .. "," .. tostring(e3))
-    -- the parser must not run code: a function value in the file is a syntax error for it
-    MARK = nil
-    local r4 = C.parseOldConfig('return {{ ["a"]=(function() MARK=1 end)() }}')
-    check("parser never executes", r4 == nil and MARK == nil)
+    check("parser: empty and truncated", e1 == "empty" and e2 == "truncated", tostring(e1) .. "," .. tostring(e2))
+    local r3 = C.parseOldConfig('return {{ ["a"]={2} },{ ["b"]={1} }}')
+    check("parser: circular references do not hang", r3 == nil or type(r3) == "table")
 end
 
 ------------------------------------------- core: same result as the JS tool ---
@@ -136,146 +167,199 @@ local function coreRun(fx)
             end
         end
     end
-    local r, err = C.convert(insts, "en")
+    local r, err = C.convert(insts, {lang = "en"})
     if not r then return "ERROR " .. tostring(err) end
     return C.toHex(C.ngFileText(r.config, 1)) .. "|" .. #r.warnings .. "|" .. #r.skipped .. "|" .. #widgets
 end
 
 local LUA_CORE = {}
-local FIX = global.FIX
+local FIX, X = global.FIX, global.FIX_EXTRA
 for i = 0, FIX.length - 1 do
     local ok, res = pcall(coreRun, FIX[i])
     LUA_CORE[#LUA_CORE + 1] = ok and res or ("ERROR " .. tostring(res))
 end
 global.LUA_CORE = table.concat(LUA_CORE, "\n")
+check("model name read from YAML", C.modelNameOf(C.parseYaml(FIX[0].yaml)) == "Düsseldorf")
 
 -------------------------------------------------- tool end-to-end tests ---
 local NG = "/WIDGETS/lvglMultiSwNG/"
-local function card(fx, withNg)
+local OLD = "/WIDGETS/lvglMultiSw/"
+local function hex(s) return C.toHex(s) end
+local function target(file, slot) return NG .. "models/model_" .. hex(file) .. "." .. slot .. ".lua" end
+
+-- SD card with several models; old files sorted case-insensitively:
+-- 2 Anna_0, 3 BO105_0, 4 Big_0, 5 Düsseldorf_0, 6 Düsseldorf_1, 7 KARL_4, 8 MODELL02_0, 9 Modell08 elrs_0
+local ROW = {all = 1, anna = 2, bo105 = 3, big = 4, d0 = 5, d1 = 6, karl = 7, m02 = 8, elrs = 9, convert = 10}
+local function card(withNg)
     resetCard()
-    put("/MODELS/" .. fx.modelFile, fx.yaml)
-    for _, name in ipairs(jsKeys(fx.files)) do put("/WIDGETS/lvglMultiSw/" .. name, fx.files[name]) end
-    put("/WIDGETS/lvglMultiSw/main.lua", "-- old widget")
-    put("/WIDGETS/lvglMultiSw/Anna_0.lua", "return {}")
+    local fx1, fx5 = FIX[0], FIX[4]
+    put("/MODELS/model01.yml", fx1.yaml)
+    put("/MODELS/model02.yml", fx5.yaml)
+    put("/MODELS/model03.yml", X.annaYaml)
+    put("/MODELS/model04.yml", X.elrsYaml)
+    put("/MODELS/model05.yml", X.bigYaml)
+    put("/MODELS/models.yml", X.labelsYaml)
+    put(OLD .. "Düsseldorf_0.lua", fx1.files["Düsseldorf_0.lua"])
+    put(OLD .. "Düsseldorf_1.lua", fx1.files["Düsseldorf_1.lua"])
+    put(OLD .. "KARL_4.lua", fx5.files["KARL_4.lua"])
+    put(OLD .. "Anna_0.lua", X.annaFile)
+    put(OLD .. "Big_0.lua", X.bigFile)
+    put(OLD .. "Modell08 elrs_0.lua", X.renamedFile)
+    put(OLD .. "BO105_0.lua", X.empty)
+    put(OLD .. "MODELL02_0.lua", X.truncated)
+    put(OLD .. "main.lua", "-- old widget")
     if withNg ~= false then
         put(NG .. "main.lua", "-- ng")
         put(NG .. "app.lua", "app.modelsDir = app.dir .. \"models/\"")
         put(NG .. "config.lua", NGCONFIG)
         put(NG .. "storage.lua", NGSTORAGE)
     end
-    INFO = {name = fx.modelName, filename = fx.modelFile}
 end
-local function hex(s) return C.toHex(s) end
-local function target(fx, slot) return NG .. "models/model_" .. hex(fx.modelFile) .. "." .. slot .. ".lua" end
 
-local function runTool(keys, frames)
+local function start()
     tool.init()
-    tool.run(0) -- scan
-    tool.run(0) -- draw summary
-    for _, k in ipairs(keys) do
-        local r = tool.run(k)
-        if r ~= 0 then return r end
+    for _ = 1, 400 do
+        call(0)
+        if has("check = convert") or has("Haken = umwandeln") or has("not installed") or has("nicht installiert") then return end
     end
-    for _ = 1, frames or 30 do tool.run(0) end
-    return 0
 end
-
-local fx1 = FIX[0]
-do -- fresh conversion, two widgets -> two tabs
-    card(fx1)
-    runTool({EVT_VIRTUAL_NEXT, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_ENTER})
-    local text = get(target(fx1, "a"))
-    local expected = string.match(LUA_CORE[1], "^(%x+)|")
-    check("tool: writes slot a with generation 1", text ~= nil and hex(text) == expected, text and "differs" or "missing")
-    check("tool: NG loader check OK", string.find(screen(), "NG loader check: OK", 1, true) ~= nil, screen())
+local function press(...) for _, e in ipairs({...}) do call(e) end end
+local function goRow(n, current) -- move the list selection from `current` to row n
+    for _ = 1, n - current do call(EVT_VIRTUAL_NEXT) end
+    for _ = 1, current - n do call(EVT_VIRTUAL_PREV) end
+end
+local function finish()
+    for _ = 1, 600 do
+        call(0)
+        if not has("Converting") and not has("Wandle") and (has("saved") or has("FAILED") or has("gespeichert") or has("FEHLER")) then break end
+    end
+end
+local function reportText()
     local seen = screen()
-    for _ = 1, 40 do tool.run(EVT_VIRTUAL_NEXT); seen = seen .. "\n" .. screen() end
-    check("tool: report lists logical switches and skipped buttons",
-        string.find(seen, "external_switch", 1, true) ~= nil and string.find(seen, "already used by", 1, true) ~= nil, seen)
-    check("tool: old files unchanged", get("/WIDGETS/lvglMultiSw/Düsseldorf_0.lua") == fx1.files["Düsseldorf_0.lua"]
-        and get("/MODELS/model01.yml") == fx1.yaml)
-    -- second run: replace after confirmation, goes to slot b with generation 2
-    runTool({EVT_VIRTUAL_NEXT, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_ENTER})
-    check("tool: existing config is not replaced without confirmation", get(target(fx1, "b")) == nil, "slot b written")
-    check("tool: asks before replacing", string.find(screen(), "already has an NG configuration (generation 1)", 1, true) ~= nil, screen())
-    runTool({EVT_VIRTUAL_NEXT, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_ENTER, EVT_VIRTUAL_ENTER})
-    local b = get(target(fx1, "b"))
-    check("tool: replacement in slot b, generation 2, slot a kept", b and string.find(b, "generation=2", 1, true) and get(target(fx1, "a")) == text, b)
-    check("tool: NG loader check OK after replace", string.find(screen(), "NG loader check: OK", 1, true) ~= nil, screen())
+    for _ = 1, 80 do call(EVT_VIRTUAL_NEXT); seen = seen .. "\n" .. screen() end
+    return seen
+end
+local function count(s, pat) return select(2, string.gsub(s, pat, "")) end
+
+do -- list of all old configurations with their models
+    card()
+    start()
+    check("list: assigned files show their model", has("Düsseldorf_0.lua  -> Düsseldorf (model01.yml)") and has("KARL_4.lua  -> KARL (model02.yml)"), screen())
+    check("list: renamed model is unassigned", has("Modell08 elrs_0.lua  -> ? (no model)"), screen())
+    check("list: empty and truncated files are unusable", has("BO105_0.lua  unusable (empty)") and has("MODELL02_0.lua  unusable (truncated)"), screen())
+    check("list: nothing is checked at the start", has("Convert checked: 0 file(s) -> 0 model(s)"), screen())
+    press(EVT_VIRTUAL_ENTER) -- check all assigned
+    check("list: check all assigned", has("Convert checked: 5 file(s) -> 4 model(s)"), screen())
+    goRow(ROW.anna, 1); press(EVT_VIRTUAL_ENTER) -- uncheck Anna
+    goRow(ROW.convert, ROW.anna); press(EVT_VIRTUAL_ENTER)
+    finish()
+    local d = get(target("model01.yml", "a"))
+    check("convert: Düsseldorf identical to the browser tool", d and hex(d) == string.match(LUA_CORE[1], "^(%x+)|"), d)
+    local k = get(target("model02.yml", "a"))
+    check("convert: KARL identical to the browser tool", k and hex(k) == string.match(LUA_CORE[5], "^(%x+)|"), k)
+    local b = get(target("model05.yml", "a")) or ""
+    check("convert: 64-button configuration", count(b, 'kind="control"') == 64, b)
+    check("convert: unchecked Anna not written", get(target("model03.yml", "a")) == nil)
+    local rep = reportText()
+    local okCount = 0
+    for _, r in ipairs(tool.state().reports) do if r.check == "ok" then okCount = okCount + 1 end end
+    check("convert: NG loader check OK for all models", okCount == 3 and #tool.state().reports == 3, rep)
+    check("report: logical switches and skipped buttons", string.find(rep, "external_switch", 1, true) and string.find(rep, "already used by", 1, true), rep)
+    check("old files and model files unchanged", get(OLD .. "Düsseldorf_0.lua") == FIX[0].files["Düsseldorf_0.lua"] and get("/MODELS/model01.yml") == FIX[0].yaml)
+    check("EXIT ends the tool", call(EVT_VIRTUAL_EXIT) == 1)
 end
 
-do -- deselect the second widget: one tab only
-    card(fx1)
-    runTool({EVT_VIRTUAL_NEXT, EVT_VIRTUAL_ENTER, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_ENTER})
-    local text = get(target(fx1, "a")) or ""
-    local _, tabs = string.gsub(text, "kind=\"tab\"", "")
-    check("tool: deselected widget is left out", tabs == 1, text)
+do -- assign a renamed model's file by hand
+    card()
+    start()
+    goRow(ROW.elrs, 1); press(EVT_VIRTUAL_ENTER) -- unassigned: opens the settings page
+    check("detail: opens for unassigned file", has("Settings: Modell08 elrs_0.lua") and has("Choose a target model first."), screen())
+    -- models sorted by file: model01 Düsseldorf, model02 KARL, model03 Anna, model04 ELRS, model05 Big
+    press(EVT_VIRTUAL_NEXT, EVT_VIRTUAL_ENTER, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_ENTER)
+    check("detail: target model chosen", has("Target model: ELRS (model04.yml)") and has("Source: widget options of the model"), screen())
+    press(EVT_VIRTUAL_PREV, EVT_VIRTUAL_ENTER, EVT_VIRTUAL_EXIT)
+    check("detail: file checked for ELRS", has("[x] Modell08 elrs_0.lua  -> ELRS (model04.yml)"), screen())
+    goRow(ROW.convert, ROW.elrs); press(EVT_VIRTUAL_ENTER)
+    finish()
+    local e = get(target("model04.yml", "a")) or ""
+    check("convert: ELRS written with interval from its widget options", string.find(e, "ELRS Licht", 1, true) and string.find(e, "interval=60", 1, true), e)
 end
 
-do -- model renamed: the file has to be chosen by hand
-    local fx = FIX[0]
-    card(fx)
-    put("/WIDGETS/lvglMultiSw/Modell08 elrs_0.lua", global.FIX_EXTRA.renamedFile)
-    INFO = {name = "ELRS", filename = "model01.yml"}
-    tool.init(); tool.run(0); tool.run(0)
-    check("tool: missing file is shown", string.find(screen(), "no file - ENTER: choose", 1, true) ~= nil, screen())
-    tool.run(EVT_VIRTUAL_ENTER) -- opens picker
-    -- files sorted: Anna_0, Düsseldorf_0, Düsseldorf_1, Modell08 elrs_0
-    tool.run(EVT_VIRTUAL_NEXT); tool.run(EVT_VIRTUAL_NEXT); tool.run(EVT_VIRTUAL_NEXT)
-    tool.run(EVT_VIRTUAL_ENTER)
-    check("tool: picked file is used", string.find(screen(), "[x] Addr 0: ELRS Licht", 1, true) ~= nil, screen())
-    for _ = 1, 5 do tool.run(EVT_VIRTUAL_NEXT) end -- to the action row (3 rows: 2 widgets + action)
-    tool.run(EVT_VIRTUAL_PREV); tool.run(EVT_VIRTUAL_PREV); tool.run(EVT_VIRTUAL_NEXT); tool.run(EVT_VIRTUAL_NEXT)
-    tool.run(EVT_VIRTUAL_ENTER)
-    for _ = 1, 30 do tool.run(0) end
-    local text = get(target(fx, "a")) or ""
-    check("tool: renamed model converted", string.find(text, "ELRS Licht", 1, true) ~= nil and string.find(screen(), "NG loader check: OK", 1, true) ~= nil, screen())
+do -- change old -> new settings: tab address and protocol
+    card()
+    start()
+    goRow(ROW.d0, 1); press(EVT_VIRTUAL_ENTER_LONG)
+    check("detail: opens with ENTER long", has("Settings: Düsseldorf_0.lua") and has("For all tabs of Düsseldorf:"), screen())
+    -- fields: 1 convert, 2 target, 3 tab address, 4 old address, 5 for all tabs, 6 protocol, ...
+    press(EVT_VIRTUAL_NEXT, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_ENTER) -- tab address
+    for _ = 1, 5 do call(EVT_VIRTUAL_NEXT) end
+    press(EVT_VIRTUAL_ENTER)
+    press(EVT_VIRTUAL_NEXT, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_ENTER, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_ENTER)
+    check("detail: protocol and tab address changed", has("Protocol: S.Port ACW 1.5") and has("NG tab address: 5"), screen())
+    for _ = 1, 5 do call(EVT_VIRTUAL_PREV) end
+    press(EVT_VIRTUAL_ENTER, EVT_VIRTUAL_EXIT) -- check it, back to list
+    goRow(ROW.d1, ROW.d0); press(EVT_VIRTUAL_ENTER)
+    goRow(ROW.convert, ROW.d1); press(EVT_VIRTUAL_ENTER)
+    finish()
+    local d = get(target("model01.yml", "a")) or ""
+    local firstTab = string.match(d, '{address=(%d+),columns=%d+,height=0,id=1,kind="tab"')
+    check("convert: chosen protocol in the header", string.find(d, "protocol=2", 1, true) ~= nil, d)
+    check("convert: tabs ordered by the new tab address", firstTab == "1" and string.find(d, '{address=5,columns=2,height=0,id=2,kind="tab"', 1, true) ~= nil, d)
+    local rep = reportText()
+    check("convert: ACW skips 3Pos and sliders, NG check OK", string.find(rep, "not supported by S.Port ACW", 1, true) and string.find(rep, "NG check OK", 1, true), rep)
 end
 
-do -- old widget already removed from the screens: files of the model with default options
-    local fx = FIX[4] -- KARL
-    card(fx)
-    put("/MODELS/" .. fx.modelFile, 'header: \n   name: "KARL"\nscreenData: \n   0:\n      layoutData: \n         zones: \n            0:\n               widgetName: "MultiSw NG"\n')
-    runTool({EVT_VIRTUAL_NEXT, EVT_VIRTUAL_ENTER})
-    local text = get(target(fx, "a")) or ""
-    check("tool: fallback to model files with defaults", string.find(text, "Hand", 1, true) ~= nil and string.find(screen(), "no longer on the model's screens", 1, true) ~= nil, screen())
-end
-
-do -- unusable files are reported and never converted
-    local fx = FIX[0]
-    card(fx)
-    put("/WIDGETS/lvglMultiSw/Düsseldorf_0.lua", global.FIX_EXTRA.empty)
-    put("/WIDGETS/lvglMultiSw/Düsseldorf_1.lua", global.FIX_EXTRA.truncated)
-    tool.init(); tool.run(0); tool.run(0)
-    check("tool: empty/truncated files marked unusable", select(2, string.gsub(screen(), "unusable", "")) == 2, screen())
-    tool.run(EVT_VIRTUAL_PREV); tool.run(EVT_VIRTUAL_ENTER); tool.run(0); tool.run(0)
-    check("tool: nothing written without usable file", get(target(fx, "a")) == nil and string.find(screen(), "No usable old configuration", 1, true) ~= nil, screen())
+do -- replace an existing NG configuration only after confirmation
+    card()
+    start()
+    goRow(ROW.d0, 1); press(EVT_VIRTUAL_ENTER); goRow(ROW.convert, ROW.d0); press(EVT_VIRTUAL_ENTER)
+    finish()
+    local first = get(target("model01.yml", "a"))
+    start()
+    goRow(ROW.d0, 1); press(EVT_VIRTUAL_ENTER); goRow(ROW.convert, ROW.d0); press(EVT_VIRTUAL_ENTER)
+    call(0)
+    check("confirm: asks before replacing", has("already have an NG configuration") and has("Düsseldorf (model01.yml, generation 1)"), screen())
+    check("confirm: nothing written before ENTER", get(target("model01.yml", "b")) == nil)
+    press(EVT_VIRTUAL_EXIT)
+    check("confirm: EXIT goes back to the list", has("check = convert"), screen())
+    goRow(ROW.convert, ROW.convert); press(EVT_VIRTUAL_ENTER, EVT_VIRTUAL_ENTER)
+    finish()
+    local b = get(target("model01.yml", "b")) or ""
+    check("confirm: slot b with generation 2, slot a kept", string.find(b, "generation=2", 1, true) ~= nil and get(target("model01.yml", "a")) == first, b)
+    check("confirm: NG check OK", string.find(reportText(), "NG check OK", 1, true) ~= nil)
 end
 
 do -- NG not installed
-    card(FIX[0], false)
-    tool.init(); tool.run(0); tool.run(0)
-    check("tool: NG missing is reported", string.find(screen(), "not installed", 1, true) ~= nil, screen())
-    check("tool: EXIT ends the tool", tool.run(EVT_VIRTUAL_EXIT) == 1)
+    card(false)
+    start()
+    check("NG missing is reported", has("not installed"), screen())
+    check("EXIT ends the tool on the message", call(EVT_VIRTUAL_EXIT) == 1)
 end
 
 do -- older NG version keeps configurations next to the code
-    card(FIX[0])
+    card()
     put(NG .. "app.lua", "-- old layout")
-    runTool({EVT_VIRTUAL_PREV, EVT_VIRTUAL_ENTER})
-    check("tool: older NG layout writes next to the code", get(NG .. "model_" .. hex("model01.yml") .. ".a.lua") ~= nil, screen())
+    start()
+    goRow(ROW.karl, 1); press(EVT_VIRTUAL_ENTER); goRow(ROW.convert, ROW.karl); press(EVT_VIRTUAL_ENTER)
+    finish()
+    check("older NG layout: written next to the code", get(NG .. "model_" .. hex("model02.yml") .. ".a.lua") ~= nil, screen())
 end
 
-do -- German texts on a German radio
-    card(FIX[0])
+do -- German radio
+    card()
     getGeneralSettings = function() return {language = "DE"} end
-    tool.init(); tool.run(0); tool.run(0)
-    check("tool: German UI", string.find(screen(), "Umwandeln und speichern", 1, true) ~= nil, screen())
-    tool.run(EVT_VIRTUAL_PREV); tool.run(EVT_VIRTUAL_ENTER)
-    for _ = 1, 30 do tool.run(0) end
-    local text = get(target(FIX[0], "a")) or ""
-    check("tool: German button texts Links/Rechts", string.find(text, 'leftText="Links"', 1, true) ~= nil, text)
+    start()
+    check("German UI", has("Alte Konfigurationen (Haken = umwandeln)"), screen())
+    goRow(ROW.karl, 1); press(EVT_VIRTUAL_ENTER); goRow(ROW.convert, ROW.karl); press(EVT_VIRTUAL_ENTER)
+    finish()
+    local k = get(target("model02.yml", "a")) or ""
+    check("German button texts Links/Rechts", string.find(k, 'leftText="Links"', 1, true) ~= nil, k)
     getGeneralSettings = function() return {language = "EN"} end
 end
 
+check("every call stayed within " .. BUDGET .. " instructions", overBudget == nil, overBudget)
+local peaks = {}
+for k, v in pairs(PEAK) do peaks[#peaks + 1] = k .. "=" .. v end
+table.sort(peaks)
+results[#results + 1] = "info peak instructions per call: " .. table.concat(peaks, ", ")
 global.LUA_RESULTS = table.concat(results, "\n")

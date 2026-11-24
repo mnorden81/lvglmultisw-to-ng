@@ -99,5 +99,12 @@
     renamedFile: tableser(settings({ name: "ELRS Licht" }, Array.from({ length: 8 }, (_, k) => btn(k + 1, 0)))),
     empty: "",
     truncated: dussel1.slice(0, 400),
+    elrsYaml: yaml("ELRS", zone(0, "MultiSwE/L", optsFor({ 1: ["Signed", 0], 2: ["Signed", 60] }))),
+    annaYaml: yaml("Anna", zone(0, '"MultiSw NG"')),
+    annaFile: tableser(settings({ name: "Anna Licht" }, Array.from({ length: 4 }, (_, k) => btn(k + 1, 0)))),
+    // largest layout the old widget allows: 64 buttons on 8 addresses
+    bigYaml: yaml("Big", zone(0, "MultiSwE/L", optsFor({ 1: ["Signed", 0] }))),
+    bigFile: tableser(settings({ name: "Gross", rows: 16, columns: 4 }, Array.from({ length: 64 }, (_, k) => btn(k + 1, 0, { name: "Schalter " + (k + 1), external_switch: k % 3 === 0 ? 200 + k : 0 })))),
+    labelsYaml: "Anna:\n   - Gruppe\nLabels: \n   Gruppe: \n      icon: \"\"\n",
   };
 })();

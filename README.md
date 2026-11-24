@@ -22,23 +22,32 @@ The tool does not change model files.
 
 ## On the radio: EdgeTX tool script
 
-[`edgetx/SCRIPTS/TOOLS/msw2ng.lua`](edgetx/SCRIPTS/TOOLS/msw2ng.lua) does the same conversion directly on the radio,
-for the **currently loaded model**:
+[`edgetx/SCRIPTS/TOOLS/msw2ng.lua`](edgetx/SCRIPTS/TOOLS/msw2ng.lua) does the conversion directly on the radio:
 
 1. Copy `msw2ng.lua` to `/SCRIPTS/TOOLS/` on the SD card (lvglMultiSwNG must be installed).
-2. Load the model, open *SYSTEM → Tools → MultiSw -> NG*.
-3. The list shows the model's old widgets (one future NG tab per address). Rotary selects, ENTER switches
-   a widget on/off. If the model was renamed and no file matches, ENTER lets you choose the old file.
-4. Select *Convert and save*. An existing NG configuration is only replaced after a second confirmation.
-5. The tool checks the written file with the installed NG widget's own `config.lua`/`storage.lua`
-   and shows a report of everything that was not migrated (rotary scrolls).
+2. Open *SYSTEM → Tools → MultiSw -> NG*. The tool reads the SD card and lists **all old configurations**
+   (`WIDGETS/lvglMultiSw/<Model>_<Address>.lua`) with the model each one belongs to, or `?` if no model has that
+   name any more, and marks unusable (empty or truncated) files.
+3. Check the configurations to convert: ENTER toggles one, the first line checks all assigned ones.
+4. ENTER long (or PAGE, or tapping `>`) opens the settings of a configuration, i.e. the relation old → new:
+   * target model (needed for renamed models) and NG tab address,
+   * for all tabs of that target model: protocol (CRSF, S.Port WM, ACW 1.5, ACW 1.4), interval, CRSF destination,
+     S.Port physical and app ID.
 
-Then place "MultiSw NG" instead of "MultiSwE/L". If an NG widget was already on the model, reload the model.
-If the old widget was already removed from the screens, the tool still finds the model's old files, but uses
-default widget options (CRSF, interval 100) and says so.
+   Defaults come from the old widget options in the model file (`destination` from `commandBroadcastAddress`).
+   If the old widget is no longer on the model's screens, the defaults are used and the report says so.
+5. Select *Convert checked*. All checked configurations of one model become tabs (ordered by tab address) of
+   that model's NG configuration, written where the installed NG version expects it. An existing NG
+   configuration is only replaced after confirmation, into the other slot, so the previous one stays as fallback.
+6. Each written file is checked with the installed NG widget's own `config.lua`/`storage.lua`. The report lists
+   everything that was not migrated (rotary scrolls).
 
-Compared with the browser tool there is no tab renaming or reordering (tabs follow the address order);
-do that in the NG widget afterwards. The texts are German on a German radio, otherwise English.
+Then place "MultiSw NG" instead of "MultiSwE/L" in those models. If an NG widget was already on the loaded model,
+reload the model. The texts are German on a German radio, otherwise English.
+
+Old files are never run as code: only literal table syntax passes a check before a file is loaded with an empty
+environment. The work is split into small steps per frame to stay within EdgeTX's CPU limit per script call
+(the tests check every call against an instruction budget).
 
 ## Not migrated
 
