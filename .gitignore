@@ -1,0 +1,5 @@
+test-out/
+test-ui-work/
+node_modules/
+__pycache__/
+*.zip

@@ -1,0 +1,1219 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MultiSwitch NG migration</title>
+<style>
+:root { color-scheme: light dark; --bg:#f6f7f9; --fg:#1d2330; --card:#fff; --line:#d7dce4; --muted:#667085; --acc:#1f6feb; --warn:#b54708; --ok:#067647; --info:#475467; }
+@media (prefers-color-scheme: dark) { :root { --bg:#14171d; --fg:#e6e9ef; --card:#1c2029; --line:#2f3542; --muted:#98a2b3; --acc:#5b9dff; --warn:#f79009; --ok:#47cd89; --info:#98a2b3; } }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
+.wrap { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
+header.top { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
+h1 { font-size: 22px; margin: 0 0 8px; }
+h2 { font-size: 17px; margin: 24px 0 8px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin:12px 0; }
+.muted { color: var(--muted); font-size: 13px; }
+.warn { color: var(--warn); }
+.ok { color: var(--ok); }
+li.info { color: var(--info); }
+li.warn { color: var(--warn); }
+button { font: inherit; padding: 7px 14px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--fg); cursor:pointer; }
+button.primary { background:var(--acc); border-color:var(--acc); color:#fff; }
+button:disabled { opacity:.45; cursor:not-allowed; }
+input[type=text], select { font: inherit; padding:5px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); max-width:100%; }
+.model > header { margin-bottom: 8px; }
+.inst { display:grid; grid-template-columns: auto 1fr; gap:6px 14px; align-items:center; padding:10px 0; border-top:1px solid var(--line); }
+.inst > label, .inst > span { grid-column: 2; }
+.inst .inc { grid-column: 1; grid-row: 1 / span 4; align-self:start; }
+.inst .mv { display:flex; gap:6px; }
+.res { border-top:1px solid var(--line); padding-top:10px; }
+ul { margin: 6px 0; padding-left: 20px; }
+.actions button { margin: 0 6px 6px 0; }
+#status { margin: 8px 0; min-height: 1.4em; }
+code { background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+summary { cursor: pointer; }
+.row { display:flex; gap:8px; align-items:center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top"><div><h1 id="title"></h1><p id="intro"></p></div><button id="langBtn"></button></header>
+  <section class="card">
+    <button id="btnRw" class="primary"></button>
+    <button id="btnRo"></button>
+    <input type="file" id="dirInput" webkitdirectory multiple hidden>
+    <p class="muted" id="pickHint"></p>
+    <p class="muted" id="browserNote"></p>
+    <div id="status" class="warn"></div>
+  </section>
+  <div id="main"></div>
+</div>
+<script>/* lvglMultiSw -> lvglMultiSwNG configuration converter: core logic.
+ *
+ * Pure functions, no DOM and no file access, so the same code runs in the
+ * browser tool and in the node tests.
+ *
+ * All text is handled as "binary strings" (one JS char = one byte, latin1), so
+ * names with UTF-8 umlauts survive byte-exactly and the NG limits, which are
+ * byte limits, can be checked directly.
+ */
+(function (root, factory) {
+  if (typeof module === "object" && module.exports) module.exports = factory();
+  else root.Core = factory();
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  // ---------------------------------------------------------------- bytes ---
+  function bytesToBinary(u8) {
+    let out = "";
+    const CH = 0x8000;
+    for (let i = 0; i < u8.length; i += CH) {
+      out += String.fromCharCode.apply(null, u8.subarray(i, i + CH));
+    }
+    return out;
+  }
+  function binaryToBytes(s) {
+    const u8 = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i) & 0xff;
+    return u8;
+  }
+  // Binary string -> readable text for display (UTF-8 if valid, else as is).
+  function displayText(bin) {
+    try {
+      return decodeURIComponent(escape(bin));
+    } catch (e) {
+      return bin;
+    }
+  }
+  function toHex(bin) {
+    let h = "";
+    for (let i = 0; i < bin.length; i++) h += bin.charCodeAt(i).toString(16).padStart(2, "0");
+    return h;
+  }
+
+  // ------------------------------------------- old config file (tableser) ---
+  // The old widget stores `return { {table1}, {table2}, ... }` where a value
+  // `{n}` refers to table n. The old widget runs the file with loadfile(); we
+  // never execute it, we parse the small literal subset it can contain.
+  function parseOldConfig(text) {
+    if (!/\S/.test(text)) throw new Error("empty");
+    let pos = 0;
+    const len = text.length;
+    const fail = (msg) => {
+      throw new Error(msg);
+    };
+    const skip = () => {
+      for (;;) {
+        while (pos < len && /\s/.test(text[pos])) pos++;
+        if (text.startsWith("--", pos)) {
+          while (pos < len && text[pos] !== "\n") pos++;
+        } else break;
+      }
+    };
+    const eof = () => fail("truncated");
+    function parseString() {
+      const q = text[pos++];
+      let out = "";
+      for (;;) {
+        if (pos >= len) eof();
+        const c = text[pos++];
+        if (c === q) return out;
+        if (c !== "\\") {
+          out += c;
+          continue;
+        }
+        if (pos >= len) eof();
+        const e = text[pos++];
+        if (e === "n") out += "\n";
+        else if (e === "r") out += "\r";
+        else if (e === "t") out += "\t";
+        else if (e === "\n") out += "\n";
+        else if (/[0-9]/.test(e)) {
+          let d = e;
+          while (d.length < 3 && /[0-9]/.test(text[pos] || "")) d += text[pos++];
+          out += String.fromCharCode(parseInt(d, 10) & 0xff);
+        } else out += e;
+      }
+    }
+    function parseValue(depth) {
+      skip();
+      if (pos >= len) eof();
+      const c = text[pos];
+      if (c === "{") return parseTable(depth + 1);
+      if (c === '"' || c === "'") return parseString();
+      const m = /^(true|false|nil)\b/.exec(text.slice(pos, pos + 6));
+      if (m) {
+        pos += m[1].length;
+        return m[1] === "true" ? true : m[1] === "false" ? false : null;
+      }
+      const n = /^[-+]?(0[xX][0-9a-fA-F]+|(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?)/.exec(text.slice(pos, pos + 40));
+      if (n) {
+        pos += n[0].length;
+        return Number(n[0]);
+      }
+      return fail("unexpected character at offset " + pos);
+    }
+    function parseTable(depth) {
+      if (depth > 8) fail("nesting too deep");
+      pos++; // {
+      const t = { arr: [], hash: {}, isTable: true };
+      for (;;) {
+        skip();
+        if (pos >= len) eof();
+        if (text[pos] === "}") {
+          pos++;
+          return t;
+        }
+        if (text[pos] === "[") {
+          pos++;
+          const k = parseValue(depth);
+          skip();
+          if (text[pos] !== "]") fail("expected ]");
+          pos++;
+          skip();
+          if (text[pos] !== "=") fail("expected =");
+          pos++;
+          const v = parseValue(depth);
+          if (k && k.isTable) fail("table keys are not supported");
+          t.hash[k] = v;
+        } else {
+          const m = /^([A-Za-z_][A-Za-z0-9_]*)\s*=/.exec(text.slice(pos, pos + 80));
+          if (m && !/^(true|false|nil)$/.test(m[1])) {
+            pos += m[0].length;
+            t.hash[m[1]] = parseValue(depth);
+          } else t.arr.push(parseValue(depth));
+        }
+        skip();
+        if (text[pos] === "," || text[pos] === ";") pos++;
+        else if (text[pos] !== "}") {
+          if (pos >= len) eof();
+          fail("expected , or } at offset " + pos);
+        }
+      }
+    }
+    skip();
+    if (!text.startsWith("return", pos)) fail("not a configuration file (no 'return')");
+    pos += 6;
+    skip();
+    if (text[pos] !== "{") fail("expected {");
+    const rootTable = parseTable(0);
+    skip();
+    if (pos < len) {
+      // trailing "--end" comment is skipped above; anything else is junk
+      fail("data after end of file");
+    }
+    const tables = rootTable.arr;
+    if (!tables.length) fail("no tables");
+    const isRef = (v) =>
+      v && v.isTable && v.arr.length === 1 && typeof v.arr[0] === "number" && !Object.keys(v.hash).length;
+    const resolving = new Set();
+    const cache = new Map();
+    function resolve(idx) {
+      if (cache.has(idx)) return cache.get(idx);
+      const raw = tables[idx - 1];
+      if (!raw || !raw.isTable) fail("invalid reference " + idx);
+      if (resolving.has(idx)) fail("circular reference");
+      resolving.add(idx);
+      const map = {};
+      const list = [];
+      const conv = (v) => {
+        if (v && v.isTable) {
+          if (!isRef(v)) fail("invalid value reference in table " + idx);
+          const target = v.arr[0];
+          if (!Number.isInteger(target) || target < 1 || target > tables.length) fail("reference out of range");
+          return resolve(target);
+        }
+        return v;
+      };
+      raw.arr.forEach((v) => list.push(conv(v)));
+      Object.keys(raw.hash).forEach((k) => (map[k] = conv(raw.hash[k])));
+      resolving.delete(idx);
+      // positional-only tables become arrays, others objects (with .list for positional part)
+      let out;
+      if (Object.keys(map).length === 0) out = list;
+      else {
+        out = map;
+        Object.defineProperty(out, "_list", { value: list, enumerable: false });
+      }
+      cache.set(idx, out);
+      return out;
+    }
+    const top = resolve(1);
+    if (Array.isArray(top)) fail("unexpected top-level layout");
+    return top;
+  }
+
+  // ----------------------------------------------------- model YAML (mini) ---
+  function unquote(v) {
+    v = v.trim();
+    const q = v[0];
+    if ((q === '"' || q === "'") && v.length >= 2 && v[v.length - 1] === q) {
+      const body = v.slice(1, -1);
+      if (q === "'") return body.replace(/''/g, "'");
+      return body.replace(/\\(x[0-9a-fA-F]{2}|.)/g, (m, e) =>
+        e[0] === "x" && e.length === 3 ? String.fromCharCode(parseInt(e.slice(1), 16)) : e
+      );
+    }
+    return v.replace(/\s+#.*$/, "");
+  }
+  // EdgeTX model files use nested "key: value" maps with numeric keys instead
+  // of lists, so an indentation based key/value parser is enough.
+  function parseYaml(text) {
+    const root = {};
+    const stack = [{ indent: -1, obj: root }];
+    for (const raw of text.split(/\r?\n/)) {
+      if (!/\S/.test(raw) || /^\s*#/.test(raw)) continue;
+      const m = /^( *)(.+?):(?:\s+(.*?))?\s*$/.exec(raw);
+      if (!m || /^\s*-\s/.test(raw)) continue;
+      const indent = m[1].length;
+      while (stack.length > 1 && stack[stack.length - 1].indent >= indent) stack.pop();
+      const parent = stack[stack.length - 1].obj;
+      const key = m[2].trim().replace(/^["']|["']$/g, "");
+      if (m[3] === undefined || m[3] === "") {
+        const child = {};
+        parent[key] = child;
+        stack.push({ indent, obj: child });
+      } else parent[key] = unquote(m[3]);
+    }
+    return root;
+  }
+
+  const OLD_WIDGET = "MultiSwE/L";
+  const NG_WIDGET = "MultiSw NG";
+  const OPTION_DEFS = [
+    ["CRSF", 1],
+    ["Address", 0],
+    ["Intervall", 100],
+    ["ShmEncoding", 0],
+    ["ShmVarStart", 1],
+    ["ShmSync", 0],
+    ["SPort", 0],
+    ["SPortPhy", 0],
+    ["SPortApp", 0x51],
+    ["SPortProto", 1],
+  ];
+
+  function optionValue(entry) {
+    if (!entry || typeof entry !== "object") return undefined;
+    const v = entry.value || {};
+    for (const k of ["boolValue", "signedValue", "unsignedValue"]) {
+      if (v[k] !== undefined) return Number(v[k]);
+    }
+    return undefined;
+  }
+
+  function sortedKeys(obj) {
+    return Object.keys(obj || {})
+      .filter((k) => /^\d+$/.test(k))
+      .sort((a, b) => a - b);
+  }
+
+  // Finds the MultiSwitch widgets (old and NG) of a parsed model YAML.
+  function findWidgets(yaml) {
+    const found = [];
+    const screens = yaml.screenData || {};
+    for (const s of sortedKeys(screens)) {
+      const zones = (((screens[s] || {}).layoutData || {}).zones) || {};
+      for (const z of sortedKeys(zones)) {
+        const zone = zones[z] || {};
+        const name = zone.widgetName;
+        if (name !== OLD_WIDGET && name !== NG_WIDGET) continue;
+        const entry = { kind: name === OLD_WIDGET ? "old" : "ng", screen: Number(s) + 1, zone: Number(z) + 1 };
+        if (entry.kind === "old") {
+          const opts = ((zone.widgetData || {}).options) || {};
+          entry.options = {};
+          OPTION_DEFS.forEach(([n, def], i) => {
+            const v = optionValue(opts[i]);
+            entry.options[n] = v === undefined ? def : v;
+          });
+        }
+        found.push(entry);
+      }
+    }
+    return found;
+  }
+
+  function modelNameOf(yaml) {
+    return (yaml.header && yaml.header.name) || "";
+  }
+
+  // ---------------------------------------------------------- NG schema ---
+  const SCHEMAS = {
+    config: {
+      version: [1, 1], generation: [0, 2147483647], name: 32,
+      destination: [0, 255], interval: [5, 1000], sendColors: [0, 1], autoSave: [0, 1],
+      buttonSpacing: [-1, 40], protocol: [0, 3], sportPhysicalId: [0, 0x1b], sportAppId: [0, 255],
+    },
+    tab: { id: [1, 2147483647], name: 32, address: [0, 255], columns: [1, 4], height: [0, 240] },
+    control: {
+      id: [1, 2147483647], tab: [1, 2147483647], name: 32, leftText: 32, rightText: 32,
+      type: [1, 5], address: [-1, 255], output: [1, 8],
+      color: [-2147483648, 4294967295], textColor: [-2147483648, 4294967295], font: [0, 65535],
+      visible: [0, 1], switch: [-2147483648, 2147483647], switch2: [-2147483648, 2147483647],
+      source: [-2147483648, 2147483647], activation: [-2147483648, 2147483647], group: [0, 255], image: 128,
+      sportType: [0, 255], sportOptions: [0, 255], sportPwmOn: [0, 255],
+    },
+  };
+  function validateRecord(rec) {
+    const schema = SCHEMAS[rec.kind];
+    if (!schema) return "unknown record";
+    for (const [k, rule] of Object.entries(schema)) {
+      const v = rec[k];
+      if (typeof rule === "number") {
+        if (typeof v !== "string" || v.length > rule || /[\x00-\x1f]/.test(v)) return "invalid " + rec.kind + "." + k;
+      } else if (!(Number.isInteger(v) && v >= rule[0] && v <= rule[1])) return "invalid " + rec.kind + "." + k;
+    }
+    for (const k of Object.keys(rec)) if (k !== "kind" && !(k in schema)) return "unknown property " + k;
+    return null;
+  }
+
+  // ------------------------------------------------------------ helpers ---
+  function cutBytes(s, max) {
+    if (s.length <= max) return s;
+    let n = max;
+    while (n > 0 && (s.charCodeAt(n) & 0xc0) === 0x80) n--; // do not split a UTF-8 sequence
+    return s.slice(0, n);
+  }
+  function cleanString(v, max, fallback) {
+    let s = typeof v === "string" ? v : v === undefined || v === null ? "" : String(v);
+    s = s.replace(/[\x00-\x1f\x7f]/g, " ");
+    s = cutBytes(s, max);
+    return s === "" && fallback !== undefined ? fallback : s;
+  }
+  function int(v, def) {
+    if (typeof v === "boolean") return v ? 1 : 0;
+    return typeof v === "number" && isFinite(v) ? Math.trunc(v) : def;
+  }
+  function clamp(v, lo, hi) {
+    return Math.min(hi, Math.max(lo, v));
+  }
+
+  // ------------------------------------------------------------ convert ---
+  /*
+   * instances: [{ address, options, settings (parsed old config), tabName, label }]
+   *   in tab order. Returns {config, warnings, skipped, stats}.
+   */
+  function convert(instances, opts) {
+    opts = opts || {};
+    const lang = opts.lang === "en" ? "en" : "de";
+    const leftText = lang === "en" ? "Left" : "Links";
+    const rightText = lang === "en" ? "Right" : "Rechts";
+    const warnings = [];
+    const skipped = [];
+    const warn = (level, text) => warnings.push({ level, text });
+    if (!instances.length) throw new Error("no widgets selected");
+
+    const first = instances[0];
+    const o0 = first.options;
+
+    // --- transport -----------------------------------------------------
+    const protoOf = (o) => (o.CRSF ? 0 : o.SPort ? clamp(int(o.SPortProto, 1), 1, 3) : 0);
+    const protocol = protoOf(o0);
+    if (!o0.CRSF && !o0.SPort)
+      warn("warn", "CRSF and S.Port were both switched off in the old widget options, so it sent nothing itself (maybe SHM/mixer script or a plain UI). NG always sends; CRSF was chosen. Check the transport before use.");
+    if (o0.CRSF && o0.SPort)
+      warn("warn", "The old widget sent CRSF and S.Port at the same time; NG supports one protocol per model, CRSF was chosen.");
+    for (const inst of instances.slice(1)) {
+      const o = inst.options;
+      if (protoOf(o) !== protocol || (protocol > 0 && (o.SPortPhy !== o0.SPortPhy || o.SPortApp !== o0.SPortApp)))
+        warn("warn", inst.label + ": other transport settings than the first widget; NG uses one protocol per model, the first widget's settings were kept.");
+      if (o.Intervall !== o0.Intervall) warn("info", inst.label + ": different send interval; the first widget's interval was kept.");
+    }
+    const interval = clamp(int(o0.Intervall, 100), 5, 1000);
+
+    const settings0 = first.settings || {};
+    const destination = clamp(int(settings0.commandBroadcastAddress, 0), 0, 255);
+    for (const inst of instances.slice(1)) {
+      if (clamp(int((inst.settings || {}).commandBroadcastAddress, 0), 0, 255) !== destination)
+        warn("warn", inst.label + ": different CRSF destination; the first widget's value was kept.");
+    }
+    const sendColors = instances.some((i) => int((i.settings || {}).activate_color_proto, 0) > 0) ? 1 : 0;
+    if (sendColors && instances.some((i) => int((i.settings || {}).activate_color_proto, 0) === 0))
+      warn("info", "LED colors were enabled in only some widgets; NG has one setting for the whole model (enabled).");
+
+    const config = {
+      header: {
+        kind: "config", version: 1, generation: 0, name: "MultiSwitch NG",
+        destination, interval, sendColors, autoSave: 1, buttonSpacing: -1,
+        protocol, sportPhysicalId: clamp(int(o0.SPortPhy, 0), 0, 0x1b), sportAppId: clamp(int(o0.SPortApp, 0x51), 0, 255),
+      },
+      tabs: [],
+      controls: [],
+    };
+
+    // --- tabs and controls ------------------------------------------
+    const usedEndpoints = new Map();
+    const nameCount = {};
+    let controlId = 0;
+    const stats = { controls: 0, skipped: 0 };
+    instances.forEach((inst, ti) => {
+      const st = inst.settings || {};
+      const address = clamp(int(inst.address, 0), 0, 255);
+      let name = cleanString(inst.tabName, 32, cleanString(st.name, 32, "Tab " + (ti + 1)));
+      nameCount[name] = (nameCount[name] || 0) + 1;
+      if (nameCount[name] > 1) name = cutBytes(name, 28) + " " + (address);
+      let columns = int(st.columns, 2);
+      if (columns < 1 || columns > 4) {
+        warn("warn", inst.label + ": " + columns + " columns are not possible in NG (1..4); " + clamp(columns, 1, 4) + " used.");
+        columns = clamp(columns, 1, 4);
+      }
+      const tab = { kind: "tab", id: ti + 1, name, address, columns, height: 0 };
+      config.tabs.push(tab);
+
+      const buttons = Array.isArray(st.buttons) ? st.buttons : [];
+      const extSwitch = [];
+      const virtInput = [];
+      if (!buttons.length) warn("warn", inst.label + ": the old configuration contains no buttons.");
+      buttons.forEach((b, bi) => {
+        const label = inst.label + " / " + (b && b.name !== undefined ? displayText(String(b.name)) : "Output " + (bi + 1));
+        if (!b || typeof b !== "object") return void skipped.push({ label, reason: "invalid button record" });
+        const type = int(b.type, 1);
+        const output = int(b.output, ((bi % 8) + 1));
+        const bAddr = int(b.address, address);
+        if (type < 1 || type > 5) return void skip(label, "unknown control type " + type);
+        if (protocol === 1 && type === 5) return void skip(label, "sliders are not supported by S.Port WM");
+        if (protocol >= 2 && (type === 3 || type === 5)) return void skip(label, "3Pos controls and sliders are not supported by S.Port ACW");
+        if (output < 1 || output > 8) return void skip(label, "output " + output + " is outside 1..8");
+        if (bAddr < 0 || bAddr > 255) return void skip(label, "address " + bAddr + " is outside 0..255");
+        const endpoint = bAddr * 8 + output;
+        if (protocol >= 2 && endpoint > 255) return void skip(label, "ACW switch number " + endpoint + " exceeds 255");
+        if (usedEndpoints.has(endpoint))
+          return void skip(label, "address/output " + bAddr + "/" + output + " is already used by " + usedEndpoints.get(endpoint));
+        usedEndpoints.set(endpoint, label);
+
+        const sp = b.sport && typeof b.sport === "object" ? b.sport : {};
+        const rec = {
+          kind: "control", id: ++controlId, tab: tab.id,
+          name: cleanString(b.name, 32, "Output " + output),
+          leftText, rightText, type,
+          address: bAddr === address ? -1 : bAddr, output,
+          color: int(b.color, 327680), textColor: int(b.textColor, 131072), font: clamp(int(b.font, 0), 0, 65535),
+          visible: int(b.visible, 1) ? 1 : 0,
+          switch: int(b.switch, 0), switch2: int(b.switch2, 0), source: int(b.source, 0),
+          activation: int(b.activation_switch, 0), group: clamp(int(b.exclusive_group, 0), 0, 255),
+          image: cleanString(b.image, 128, ""),
+          sportType: clamp(int(sp.type, 1), 0, 255), sportOptions: clamp(int(sp.options, 0), 0, 255),
+          sportPwmOn: clamp(int(sp.pwm_on, 255), 0, 255),
+        };
+        if (typeof b.name === "string" && rec.name !== b.name) warn("info", label + ": name was shortened or cleaned to fit NG limits.");
+        if (int(b.setVirtualInput, 0) > 0) virtInput.push(rec.name);
+        if (int(b.external_switch, 0) !== 0) extSwitch.push(rec.name);
+        config.controls.push(rec);
+        stats.controls++;
+      });
+
+      const names3 = (a) => a.slice(0, 3).map((n) => displayText(n)).join(", ") + (a.length > 3 ? ", ..." : "");
+      if (extSwitch.length)
+        warn("warn", inst.label + ": " + extSwitch.length + " button(s) set an EdgeTX logical/virtual switch ('external_switch': " + names3(extSwitch) + "). NG cannot do this yet, so mixes or sounds that depend on those switches will no longer be triggered.");
+      if (virtInput.length)
+        warn("warn", inst.label + ": " + virtInput.length + " button(s) set a virtual input (" + names3(virtInput) + "). NG does not support this yet.");
+      // unsupported features at widget level
+      const tele = Array.isArray(st.telemActions) ? st.telemActions.filter((a) => a && int(a.switch, 0) !== 0) : [];
+      if (tele.length) warn("warn", inst.label + ": " + tele.length + " telemetry action(s) are configured; NG does not support them yet (dropped).");
+      if (int(st.activate_vswitches, 0) > 0) warn("warn", inst.label + ": virtual switches were activated; NG does not support them yet (dropped).");
+      if (inst.options && inst.options.ShmEncoding) warn("warn", inst.label + ": SHM encoding was enabled; NG does not support it yet (dropped).");
+      if (int(st.statusPassthru, 0) > 0) warn("info", inst.label + ": status passthrough is not supported by NG (dropped).");
+    });
+
+    function skip(label, reason) {
+      skipped.push({ label, reason });
+      stats.skipped++;
+    }
+
+    // final check with the NG schema
+    const problems = [];
+    [config.header].concat(config.tabs, config.controls).forEach((r) => {
+      const e = validateRecord(r);
+      if (e) problems.push(e);
+    });
+    if (problems.length) throw new Error("internal: generated record invalid: " + problems.slice(0, 3).join(", "));
+    return { config, warnings, skipped, stats };
+  }
+
+  // ------------------------------------------------------------- output ---
+  function luaQuote(s) {
+    let out = '"';
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === '"') out += '\\"';
+      else if (c === "\\") out += "\\\\";
+      else if (c === "\n") out += "\\n";
+      else if (c === "\r") out += "\\r";
+      else if (c === "\0") out += "\\0";
+      else if (s.charCodeAt(i) < 32 || s.charCodeAt(i) === 127) out += "\\" + String(s.charCodeAt(i));
+      else out += c;
+    }
+    return out + '"';
+  }
+  // Same layout as storage.lua serialize(): one line per record, sorted fields.
+  function serializeRecord(rec) {
+    const fields = Object.keys(rec).map((k) => k + "=" + (typeof rec[k] === "string" ? luaQuote(rec[k]) : String(rec[k])));
+    fields.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    return "{" + fields.join(",") + "},\n";
+  }
+  function ngFileText(config, generation) {
+    const header = Object.assign({}, config.header, { generation });
+    let text = "return {\n" + serializeRecord(header);
+    config.tabs.forEach((t) => (text += serializeRecord(t)));
+    config.controls.forEach((c) => (text += serializeRecord(c)));
+    return text + "}\n";
+  }
+  function ngFileNames(modelFileName) {
+    const base = "model_" + toHex(modelFileName);
+    return { a: base + ".a.lua", b: base + ".b.lua" };
+  }
+  // existing: {a: text|null, b: text|null}. Returns which slot to write and the generation.
+  function planWrite(existing) {
+    const gen = (t) => {
+      if (t == null) return -1;
+      const m = /generation=(\d+)/.exec(t.slice(0, 600));
+      return m ? Number(m[1]) : 0;
+    };
+    const ga = gen(existing.a), gb = gen(existing.b);
+    if (ga < 0 && gb < 0) return { slot: "a", generation: 1, replaces: false };
+    const max = Math.max(ga, gb);
+    // write the other slot than the newest one, with a higher generation
+    return { slot: ga >= gb ? "b" : "a", generation: max + 1, replaces: true };
+  }
+
+  return {
+    bytesToBinary, binaryToBytes, displayText, toHex,
+    parseOldConfig, parseYaml, findWidgets, modelNameOf, OPTION_DEFS, OLD_WIDGET, NG_WIDGET,
+    convert, validateRecord, serializeRecord, ngFileText, ngFileNames, planWrite,
+  };
+});
+</script>
+<script>/* SD card scanning and write planning, independent of the DOM.
+ *
+ * `fs` is an adapter with (all paths relative to the SD root, "/" separated,
+ * resolved case-insensitively like on a FAT card):
+ *   async list(path)            -> [{name, kind: "file" | "dir"}] | null
+ *   async read(path)            -> Uint8Array | null
+ *   async write(path, u8)       -> void
+ *   async mkdir(path)           -> void
+ */
+(function (root, factory) {
+  if (typeof module === "object" && module.exports) module.exports = factory(require("./core.js"));
+  else root.Scan = factory(root.Core);
+})(typeof self !== "undefined" ? self : this, function (Core) {
+  "use strict";
+
+  const OLD_DIR = "WIDGETS/lvglMultiSw";
+  const NG_DIR = "WIDGETS/lvglMultiSwNG";
+
+  const lower = (s) => s.toLowerCase();
+
+  async function readText(fs, path) {
+    const u8 = await fs.read(path);
+    return u8 ? Core.bytesToBinary(u8) : null;
+  }
+
+  async function loadOldConfig(fs, name) {
+    const text = await readText(fs, OLD_DIR + "/" + name);
+    if (text === null) return { ok: false, error: "missing" };
+    try {
+      const settings = Core.parseOldConfig(text);
+      if (!settings.buttons || !Array.isArray(settings.buttons)) return { ok: false, error: "no buttons" };
+      return { ok: true, settings };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  }
+
+  async function detectNg(fs, opts) {
+    const entries = await fs.list(NG_DIR);
+    if (!entries) return { installed: false, modelsDir: true, detected: true, target: NG_DIR + "/models" };
+    const appLua = await readText(fs, NG_DIR + "/app.lua");
+    // Newer NG versions keep configurations in models/, older ones next to the code.
+    let modelsDir = appLua === null ? true : /modelsDir/.test(appLua);
+    const detected = modelsDir;
+    if (opts && typeof opts.modelsDir === "boolean") modelsDir = opts.modelsDir;
+    return { installed: true, modelsDir, detected, target: modelsDir ? NG_DIR + "/models" : NG_DIR };
+  }
+
+  async function scan(fs, opts) {
+    const result = { models: [], orphans: [], ng: null, problems: [] };
+    result.ng = await detectNg(fs, opts);
+
+    // old config files: <ModelName>_<Address>.lua
+    const oldEntries = (await fs.list(OLD_DIR)) || [];
+    const cfgFiles = [];
+    for (const e of oldEntries) {
+      const m = e.kind === "file" && /^(.+)_(\d+)\.lua$/i.exec(e.name);
+      if (m) cfgFiles.push({ name: e.name, base: m[1], address: Number(m[2]), parsed: null });
+    }
+    cfgFiles.sort((a, b) => a.name.localeCompare(b.name));
+    for (const f of cfgFiles) f.parsed = await loadOldConfig(fs, f.name);
+    result.configFiles = cfgFiles;
+
+    const modelEntries = ((await fs.list("MODELS")) || []).filter((e) => e.kind === "file" && /\.yml$/i.test(e.name));
+    modelEntries.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    const usedFiles = new Set();
+    for (const entry of modelEntries) {
+      const text = await readText(fs, "MODELS/" + entry.name);
+      if (text === null) continue;
+      let yaml;
+      try {
+        yaml = Core.parseYaml(text);
+      } catch (e) {
+        result.problems.push(entry.name + ": " + e.message);
+        continue;
+      }
+      const widgets = Core.findWidgets(yaml);
+      if (!widgets.length) continue;
+      const nameBin = Core.modelNameOf(yaml);
+      const name = Core.displayText(nameBin);
+      const old = widgets.filter((w) => w.kind === "old");
+      const ngWidgets = widgets.filter((w) => w.kind === "ng");
+
+      // one tab per distinct address (widgets with the same address share one file)
+      const byAddress = new Map();
+      for (const w of old) {
+        const key = w.options.Address;
+        if (!byAddress.has(key)) byAddress.set(key, { address: key, options: w.options, widgets: [] });
+        byAddress.get(key).widgets.push({ screen: w.screen, zone: w.zone });
+      }
+      const instances = [];
+      for (const inst of [...byAddress.values()].sort((a, b) => a.address - b.address)) {
+        const wanted = lower(name) + "_" + inst.address + ".lua";
+        const match = cfgFiles.find((f) => lower(f.name) === wanted);
+        if (match) usedFiles.add(match.name);
+        inst.file = match ? match.name : null;
+        inst.autoMatched = !!match;
+        inst.include = !!(match && match.parsed.ok);
+        const st = match && match.parsed.ok ? match.parsed.settings : null;
+        inst.tabName = st && st.name ? Core.displayText(String(st.name)) : "Tab " + (instances.length + 1);
+        instances.push(inst);
+      }
+
+      // existing NG configuration for this model
+      const names = Core.ngFileNames(entry.name);
+      const existing = {
+        a: await readText(fs, result.ng.target + "/" + names.a),
+        b: await readText(fs, result.ng.target + "/" + names.b),
+      };
+      result.models.push({
+        file: entry.name, name, nameBin, instances, ngWidgets, existing,
+        hasExisting: existing.a !== null || existing.b !== null,
+        overwrite: false,
+      });
+    }
+    result.orphans = cfgFiles.filter((f) => !usedFiles.has(f.name));
+    return result;
+  }
+
+  // Builds the conversion result for one model from its current selection.
+  function build(model, scanResult, opts) {
+    const chosen = [];
+    const messages = [];
+    for (const inst of model.instances) {
+      if (!inst.include) continue;
+      const f = scanResult.configFiles.find((c) => c.name === inst.file);
+      if (!f) {
+        messages.push("Address " + inst.address + ": no configuration file selected.");
+        continue;
+      }
+      if (!f.parsed.ok) {
+        messages.push(f.name + ": cannot be used (" + f.parsed.error + ").");
+        continue;
+      }
+      chosen.push({
+        address: inst.address, options: inst.options, settings: f.parsed.settings,
+        tabName: inst.tabName,
+        label: "Address " + inst.address + " (" + f.name + ")",
+      });
+    }
+    if (!chosen.length) return { ok: false, messages: messages.length ? messages : ["No usable old configuration selected."] };
+    let conv;
+    try {
+      conv = Core.convert(
+        chosen.map((c) => Object.assign({}, c, { tabName: utf8ToBinary(c.tabName) })),
+        opts
+      );
+    } catch (e) {
+      return { ok: false, messages: messages.concat(e.message) };
+    }
+    const plan = Core.planWrite(model.existing);
+    const names = Core.ngFileNames(model.file);
+    const text = Core.ngFileText(conv.config, plan.generation);
+    return {
+      ok: true, messages, conv, plan, text,
+      path: scanResult.ng.target + "/" + (plan.slot === "a" ? names.a : names.b),
+      blockedByExisting: plan.replaces && !model.overwrite,
+    };
+  }
+
+  function utf8ToBinary(s) {
+    try {
+      return unescape(encodeURIComponent(s));
+    } catch (e) {
+      return s;
+    }
+  }
+
+  async function writeResult(fs, scanResult, built) {
+    const dir = scanResult.ng.target;
+    // create missing directories one level at a time
+    const parts = dir.split("/");
+    for (let i = 1; i <= parts.length; i++) {
+      const p = parts.slice(0, i).join("/");
+      if (!(await fs.list(p))) await fs.mkdir(p);
+    }
+    await fs.write(built.path, Core.binaryToBytes(built.text));
+    const back = await fs.read(built.path);
+    if (!back || Core.bytesToBinary(back) !== built.text) throw new Error("verification failed for " + built.path);
+  }
+
+  return { OLD_DIR, NG_DIR, scan, build, writeResult, utf8ToBinary };
+});
+</script>
+<script>/* Browser UI for the lvglMultiSw -> lvglMultiSwNG converter. */
+(function () {
+  "use strict";
+
+  // ------------------------------------------------------------- i18n ---
+  const TEXT = {
+    de: {
+      title: "MultiSwitch: alte Konfiguration nach NG übernehmen",
+      intro: "Liest die SD-Karte (Modelle und Konfigurationen des alten Widgets <code>lvglMultiSw</code>) und erzeugt daraus die Konfiguration für <code>lvglMultiSwNG</code>. Gelesen wird nur; geschrieben werden ausschließlich NG-Dateien. Alte Dateien und Modelldateien bleiben unverändert. Mehrere alte Widgets eines Modells werden zu Tabs eines NG-Widgets zusammengeführt, weil NG pro Modell genau eine Konfiguration kennt.",
+      openRw: "SD-Karte öffnen (mit Schreibzugriff)",
+      openRo: "Ordner einlesen (ohne Schreibzugriff, Download als ZIP)",
+      browserNote: "Direktes Schreiben braucht Chrome oder Edge. In anderen Browsern bekommst du die Dateien als ZIP, das du auf die Karte entpackst.",
+      pickRoot: "Wähle das Hauptverzeichnis der SD-Karte (oder ein Backup davon) mit den Ordnern MODELS und WIDGETS.",
+      noRoot: "In diesem Ordner wurden MODELS und WIDGETS nicht gefunden.",
+      scanning: "Lese Karte …",
+      models: "Modelle mit altem MultiSwitch-Widget",
+      none: "Auf dieser Karte wurde kein Modell mit dem alten Widget (MultiSwE/L) gefunden.",
+      target: "Zielordner für NG-Dateien",
+      targetModels: "…/lvglMultiSwNG/models/ (aktuelle NG-Version)",
+      targetRoot: "…/lvglMultiSwNG/ (ältere NG-Version, Dateien neben dem Code)",
+      ngMissing: "Das Widget lvglMultiSwNG ist auf der Karte nicht installiert. Die Dateien werden trotzdem erzeugt; installiere das Widget danach.",
+      detected: "automatisch erkannt",
+      widgetsIn: "Altes Widget",
+      address: "Adresse",
+      position: "Bildschirm {s}, Zone {z}",
+      tabName: "Tab-Name",
+      cfgFile: "Konfigurationsdatei",
+      noFile: "— keine —",
+      up: "nach oben",
+      down: "nach unten",
+      include: "übernehmen",
+      statusOk: "{n} Buttons",
+      statusErr: "unbrauchbar: {e}",
+      result: "Ergebnis",
+      tabsControls: "{t} Tab(s), {c} Steuerelement(e)",
+      skipped: "Nicht übernommen",
+      warnings: "Hinweise",
+      existing: "Für dieses Modell gibt es schon eine NG-Konfiguration.",
+      overwrite: "NG-Konfiguration ersetzen (neue Generation {g}, die alte bleibt als zweite Datei erhalten)",
+      convertModel: "Dieses Modell schreiben",
+      notPossible: "Nicht möglich",
+      ngOnly: "Diese Modelle benutzen schon das NG-Widget (nichts zu tun)",
+      orphans: "Konfigurationsdateien, die zu keinem Widget gehören (z. B. umbenannte Modelle)",
+      write: "{n} Modell(e) auf die Karte schreiben",
+      zip: "{n} Modell(e) als ZIP herunterladen",
+      report: "Bericht herunterladen",
+      written: "Geschrieben und zurückgelesen: {p}",
+      writeFail: "Fehler: {e}",
+      zipNote: "Entpacke das ZIP im Hauptverzeichnis der SD-Karte (die Ordner WIDGETS/… werden angelegt).",
+      afterNote: "Danach in den Modellen das Widget „MultiSw NG“ statt „MultiSwE/L“ auf den Bildschirm legen. Die Modelldateien ändert dieses Tool nicht.",
+      reload: "Neu einlesen",
+      nothingSelected: "Nichts ausgewählt.",
+    },
+    en: {
+      title: "MultiSwitch: migrate old configuration to NG",
+      intro: "Reads the SD card (models and configurations of the old <code>lvglMultiSw</code> widget) and creates the configuration for <code>lvglMultiSwNG</code>. It only reads; it writes NG files only. Old files and model files stay untouched. Several old widgets of one model are merged into tabs of one NG widget, because NG keeps exactly one configuration per model.",
+      openRw: "Open SD card (with write access)",
+      openRo: "Read folder (no write access, download as ZIP)",
+      browserNote: "Writing directly needs Chrome or Edge. In other browsers you get the files as a ZIP to unpack onto the card.",
+      pickRoot: "Choose the SD card root (or a backup of it) containing the MODELS and WIDGETS folders.",
+      noRoot: "MODELS and WIDGETS were not found in this folder.",
+      scanning: "Reading card …",
+      models: "Models with the old MultiSwitch widget",
+      none: "No model with the old widget (MultiSwE/L) was found on this card.",
+      target: "Target folder for NG files",
+      targetModels: ".../lvglMultiSwNG/models/ (current NG version)",
+      targetRoot: ".../lvglMultiSwNG/ (older NG version, files next to the code)",
+      ngMissing: "The lvglMultiSwNG widget is not installed on this card. The files are still created; install the widget afterwards.",
+      detected: "detected automatically",
+      widgetsIn: "Old widget",
+      address: "Address",
+      position: "screen {s}, zone {z}",
+      tabName: "Tab name",
+      cfgFile: "Configuration file",
+      noFile: "— none —",
+      up: "move up",
+      down: "move down",
+      include: "include",
+      statusOk: "{n} buttons",
+      statusErr: "unusable: {e}",
+      result: "Result",
+      tabsControls: "{t} tab(s), {c} control(s)",
+      skipped: "Not migrated",
+      warnings: "Notes",
+      existing: "This model already has an NG configuration.",
+      overwrite: "Replace the NG configuration (new generation {g}, the old one stays as the second file)",
+      convertModel: "Write this model",
+      notPossible: "Not possible",
+      ngOnly: "These models already use the NG widget (nothing to do)",
+      orphans: "Configuration files not assigned to any widget (e.g. renamed models)",
+      write: "Write {n} model(s) to the card",
+      zip: "Download {n} model(s) as ZIP",
+      report: "Download report",
+      written: "Written and read back: {p}",
+      writeFail: "Error: {e}",
+      zipNote: "Unpack the ZIP in the SD card root (the WIDGETS/... folders are created).",
+      afterNote: "Then place the \"MultiSw NG\" widget instead of \"MultiSwE/L\" on the screen of each model. This tool does not change model files.",
+      reload: "Rescan",
+      nothingSelected: "Nothing selected.",
+    },
+  };
+  let lang = (navigator.language || "de").toLowerCase().startsWith("de") ? "de" : "en";
+  const tr = (k, v) => {
+    let s = (TEXT[lang][k] !== undefined ? TEXT[lang][k] : k);
+    if (v) for (const [a, b] of Object.entries(v)) s = s.replace("{" + a + "}", b);
+    return s;
+  };
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const $ = (id) => document.getElementById(id);
+
+  // -------------------------------------------------------- fs adapters ---
+  const lc = (s) => s.toLowerCase();
+
+  function FsaAdapter(root) {
+    async function dir(path, create) {
+      let cur = root;
+      for (const part of path.split("/").filter(Boolean)) {
+        let found = null;
+        for await (const [name, h] of cur.entries()) {
+          if (h.kind === "directory" && lc(name) === lc(part)) { found = h; break; }
+        }
+        if (!found) {
+          if (!create) return null;
+          found = await cur.getDirectoryHandle(part, { create: true });
+        }
+        cur = found;
+      }
+      return cur;
+    }
+    async function fileHandle(path, create) {
+      const parts = path.split("/");
+      const name = parts.pop();
+      const d = await dir(parts.join("/"), create);
+      if (!d) return null;
+      for await (const [n, h] of d.entries()) if (h.kind === "file" && lc(n) === lc(name)) return h;
+      return create ? d.getFileHandle(name, { create: true }) : null;
+    }
+    return {
+      writable: true,
+      async list(path) {
+        const d = await dir(path);
+        if (!d) return null;
+        const out = [];
+        for await (const [name, h] of d.entries()) out.push({ name, kind: h.kind === "directory" ? "dir" : "file" });
+        return out;
+      },
+      async read(path) {
+        const h = await fileHandle(path);
+        return h ? new Uint8Array(await (await h.getFile()).arrayBuffer()) : null;
+      },
+      async write(path, u8) {
+        const h = await fileHandle(path, true);
+        const w = await h.createWritable();
+        await w.write(u8);
+        await w.close();
+      },
+      async mkdir(path) { await dir(path, true); },
+    };
+  }
+
+  // Read-only adapter over a FileList from <input webkitdirectory>; writes are collected for the ZIP.
+  function FileListAdapter(files) {
+    const entries = new Map(); // lower path -> {path, file}
+    const all = Array.from(files).map((f) => ({ f, parts: f.webkitRelativePath.split("/") }));
+    // find the prefix depth that exposes MODELS/ and WIDGETS/
+    let depth = 1;
+    for (const d of [1, 2, 0]) {
+      if (all.some((x) => x.parts.length > d + 1 && lc(x.parts[d]) === "models")) { depth = d; break; }
+    }
+    for (const x of all) {
+      const rel = x.parts.slice(depth).join("/");
+      if (rel) entries.set(lc(rel), { path: rel, file: x.f });
+    }
+    const outputs = new Map();
+    return {
+      writable: false, outputs,
+      hasRoot: () => Array.from(entries.keys()).some((k) => k.startsWith("models/")) && Array.from(entries.keys()).some((k) => k.startsWith("widgets/")),
+      async list(path) {
+        const prefix = lc(path) ? lc(path) + "/" : "";
+        const seen = new Map();
+        for (const [k, e] of entries) {
+          if (!k.startsWith(prefix)) continue;
+          const rest = e.path.slice(prefix.length).split("/");
+          const name = rest[0];
+          const kind = rest.length > 1 ? "dir" : "file";
+          if (!seen.has(lc(name))) seen.set(lc(name), { name, kind });
+        }
+        for (const [p] of outputs) { // files created by us
+          if (!lc(p).startsWith(prefix)) continue;
+          const rest = p.slice(prefix.length).split("/");
+          if (!seen.has(lc(rest[0]))) seen.set(lc(rest[0]), { name: rest[0], kind: rest.length > 1 ? "dir" : "file" });
+        }
+        return seen.size ? Array.from(seen.values()) : null;
+      },
+      async read(path) {
+        if (outputs.has(path)) return outputs.get(path);
+        const e = entries.get(lc(path));
+        return e ? new Uint8Array(await e.file.arrayBuffer()) : null;
+      },
+      async write(path, u8) { outputs.set(path, u8); },
+      async mkdir() {},
+    };
+  }
+
+  // -------------------------------------------------------------- zip ---
+  const CRC_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+    return t;
+  })();
+  function crc32(u8) { let c = 0xffffffff; for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+  function makeZip(files) { // files: Map path -> Uint8Array (stored, no compression)
+    const enc = new TextEncoder();
+    const chunks = [], central = [];
+    let offset = 0;
+    const u16 = (n) => [n & 255, (n >> 8) & 255];
+    const u32 = (n) => [n & 255, (n >> 8) & 255, (n >> 16) & 255, (n >>> 24) & 255];
+    for (const [path, data] of files) {
+      const name = enc.encode(path), crc = crc32(data);
+      const local = Uint8Array.from([0x50, 0x4b, 3, 4, 20, 0, 0, 8, 0, 0, 0, 0, 0x21, 0, ...u32(crc), ...u32(data.length), ...u32(data.length), ...u16(name.length), 0, 0]);
+      chunks.push(local, name, data);
+      central.push(Uint8Array.from([0x50, 0x4b, 1, 2, 20, 0, 20, 0, 0, 8, 0, 0, 0, 0, 0x21, 0, ...u32(crc), ...u32(data.length), ...u32(data.length), ...u16(name.length), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...u32(offset)]), name);
+      offset += local.length + name.length + data.length;
+    }
+    const cdSize = central.reduce((a, c) => a + c.length, 0);
+    const end = Uint8Array.from([0x50, 0x4b, 5, 6, 0, 0, 0, 0, ...u16(files.size), ...u16(files.size), ...u32(cdSize), ...u32(offset), 0, 0]);
+    return new Blob([...chunks, ...central, end], { type: "application/zip" });
+  }
+  function download(blob, name) {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  }
+
+  // ------------------------------------------------------------- state ---
+  const S = { fs: null, scan: null, built: new Map(), log: [], opts: { modelsDir: undefined }, busy: false };
+  const convOpts = () => ({ lang });
+
+  function rebuild() {
+    S.built.clear();
+    for (const m of S.scan.models) if (m.instances.length) S.built.set(m, Scan.build(m, S.scan, convOpts()));
+    for (const m of S.scan.models) {
+      const b = S.built.get(m);
+      if (m.select === undefined) m.select = !!(b && b.ok && !b.blockedByExisting);
+    }
+  }
+
+  async function load(fs) {
+    S.fs = fs;
+    $("status").textContent = tr("scanning");
+    try {
+      S.scan = await Scan.scan(fs, S.opts);
+    } catch (e) {
+      $("status").textContent = tr("writeFail", { e: e.message });
+      return;
+    }
+    $("status").textContent = "";
+    S.log = [];
+    rebuild();
+    render();
+  }
+
+  // ------------------------------------------------------------ render ---
+  function fileLabel(f) {
+    const st = f.parsed.ok ? tr("statusOk", { n: f.parsed.settings.buttons.length }) : tr("statusErr", { e: f.parsed.error });
+    return Core.displayText(f.name) + "  (" + st + ")";
+  }
+
+  function render() {
+    const sc = S.scan;
+    const root = $("main");
+    if (!sc) { root.innerHTML = ""; return; }
+    let h = "";
+    const ng = sc.ng;
+    h += '<section class="card"><h2>' + esc(tr("target")) + "</h2>";
+    if (!ng.installed) h += '<p class="warn">' + esc(tr("ngMissing")) + "</p>";
+    h += '<label class="row"><select id="target">' +
+      '<option value="models"' + (ng.modelsDir ? " selected" : "") + ">" + esc(tr("targetModels")) + (ng.installed && ng.detected ? " – " + esc(tr("detected")) : "") + "</option>" +
+      '<option value="root"' + (!ng.modelsDir ? " selected" : "") + ">" + esc(tr("targetRoot")) + (ng.installed && !ng.detected ? " – " + esc(tr("detected")) : "") + "</option></select></label></section>";
+
+    const convertible = sc.models.filter((m) => m.instances.length);
+    const ngOnly = sc.models.filter((m) => !m.instances.length);
+    h += "<h2>" + esc(tr("models")) + " (" + convertible.length + ")</h2>";
+    if (!convertible.length) h += "<p>" + esc(tr("none")) + "</p>";
+    convertible.forEach((m, mi) => { h += renderModel(m, mi); });
+
+    if (ngOnly.length) {
+      h += '<details class="card"><summary>' + esc(tr("ngOnly")) + " (" + ngOnly.length + ")</summary><ul>" +
+        ngOnly.map((m) => "<li>" + esc(m.name) + " <span class='muted'>" + esc(m.file) + "</span></li>").join("") + "</ul></details>";
+    }
+    if (sc.orphans.length) {
+      h += '<details class="card"><summary>' + esc(tr("orphans")) + " (" + sc.orphans.length + ")</summary><ul>" +
+        sc.orphans.map((f) => "<li>" + esc(fileLabel(f)) + "</li>").join("") + "</ul></details>";
+    }
+
+    const sel = convertible.filter((m) => m.select && S.built.get(m) && S.built.get(m).ok && !S.built.get(m).blockedByExisting);
+    h += '<section class="card actions">';
+    if (S.fs && S.fs.writable) h += '<button id="write" class="primary"' + (sel.length ? "" : " disabled") + ">" + esc(tr("write", { n: sel.length })) + "</button> ";
+    h += '<button id="zip"' + (sel.length ? "" : " disabled") + ">" + esc(tr("zip", { n: sel.length })) + "</button> ";
+    h += '<button id="report">' + esc(tr("report")) + "</button> <button id='rescan'>" + esc(tr("reload")) + "</button>";
+    h += '<p class="muted">' + esc(tr("afterNote")) + "</p>";
+    if (!(S.fs && S.fs.writable)) h += '<p class="muted">' + esc(tr("zipNote")) + "</p>";
+    h += '<ul id="log">' + S.log.map((l) => '<li class="' + l.cls + '">' + esc(l.text) + "</li>").join("") + "</ul></section>";
+    root.innerHTML = h;
+    wire(convertible);
+  }
+
+  function renderModel(m, mi) {
+    const b = S.built.get(m);
+    let h = '<section class="card model"><header><label><input type="checkbox" data-m="' + mi + '" class="msel"' + (m.select ? " checked" : "") + (b && b.ok && !b.blockedByExisting ? "" : " disabled") + "> <strong>" + esc(m.name) + '</strong></label> <span class="muted">' + esc(m.file) + "</span></header>";
+    m.instances.forEach((inst, ii) => {
+      const pos = inst.widgets.map((w) => tr("position", { s: w.screen, z: w.zone })).join("; ");
+      const cands = S.scan.configFiles.slice().sort((a, b2) => (b2.address === inst.address) - (a.address === inst.address) || a.name.localeCompare(b2.name));
+      h += '<div class="inst"><label class="inc"><input type="checkbox" class="iinc" data-m="' + mi + '" data-i="' + ii + '"' + (inst.include ? " checked" : "") + "> " + esc(tr("include")) + "</label>" +
+        "<span>" + esc(tr("widgetsIn")) + " · " + esc(tr("address")) + " <strong>" + inst.address + "</strong> <span class='muted'>(" + esc(pos) + ")</span></span>" +
+        '<label>' + esc(tr("tabName")) + ' <input type="text" class="itab" data-m="' + mi + '" data-i="' + ii + '" maxlength="32" value="' + esc(inst.tabName) + '"></label>' +
+        '<label>' + esc(tr("cfgFile")) + ' <select class="ifile" data-m="' + mi + '" data-i="' + ii + '"><option value="">' + esc(tr("noFile")) + "</option>" +
+        cands.map((f) => '<option value="' + esc(f.name) + '"' + (f.name === inst.file ? " selected" : "") + ">" + esc(fileLabel(f)) + "</option>").join("") + "</select></label>" +
+        '<span class="mv"><button class="iup" data-m="' + mi + '" data-i="' + ii + '" title="' + esc(tr("up")) + '"' + (ii === 0 ? " disabled" : "") + '>↑</button><button class="idown" data-m="' + mi + '" data-i="' + ii + '" title="' + esc(tr("down")) + '"' + (ii === m.instances.length - 1 ? " disabled" : "") + ">↓</button></span></div>";
+    });
+    if (b && b.ok) {
+      const c = b.conv;
+      h += '<div class="res"><strong>' + esc(tr("result")) + ":</strong> " + esc(tr("tabsControls", { t: c.config.tabs.length, c: c.config.controls.length })) +
+        ' <span class="muted">→ ' + esc(b.path) + "</span>";
+      if (b.plan.replaces) {
+        h += '<p class="warn">' + esc(tr("existing")) + ' <label><input type="checkbox" class="iover" data-m="' + mi + '"' + (m.overwrite ? " checked" : "") + "> " + esc(tr("overwrite", { g: b.plan.generation })) + "</label></p>";
+      }
+      if (c.skipped.length) h += '<details open><summary class="warn">' + esc(tr("skipped")) + " (" + c.skipped.length + ")</summary><ul>" + c.skipped.map((s) => "<li>" + esc(Core.displayText(s.label)) + " – " + esc(s.reason) + "</li>").join("") + "</ul></details>";
+      const notes = b.messages.map((t) => ({ level: "warn", text: t })).concat(c.warnings);
+      if (notes.length) h += "<details" + (notes.some((n) => n.level === "warn") ? " open" : "") + "><summary>" + esc(tr("warnings")) + " (" + notes.length + ")</summary><ul>" + notes.map((n) => '<li class="' + n.level + '">' + esc(Core.displayText(n.text)) + "</li>").join("") + "</ul></details>";
+      h += "</div>";
+    } else if (b) {
+      h += '<div class="res"><strong class="warn">' + esc(tr("notPossible")) + ":</strong> " + esc(b.messages.map((x) => Core.displayText(x)).join(" ")) + "</div>";
+    }
+    return h + "</section>";
+  }
+
+  function wire(convertible) {
+    const rb = () => { rebuild(); render(); };
+    const model = (el) => convertible[Number(el.dataset.m)];
+    document.querySelectorAll(".msel").forEach((el) => el.addEventListener("change", () => { model(el).select = el.checked; render(); }));
+    document.querySelectorAll(".iinc").forEach((el) => el.addEventListener("change", () => { model(el).instances[Number(el.dataset.i)].include = el.checked; model(el).select = undefined; rb(); }));
+    document.querySelectorAll(".itab").forEach((el) => el.addEventListener("change", () => { model(el).instances[Number(el.dataset.i)].tabName = el.value; rb(); }));
+    document.querySelectorAll(".ifile").forEach((el) => el.addEventListener("change", () => {
+      const inst = model(el).instances[Number(el.dataset.i)];
+      inst.file = el.value || null;
+      const f = S.scan.configFiles.find((c) => c.name === inst.file);
+      inst.include = !!(f && f.parsed.ok);
+      if (f && f.parsed.ok && f.parsed.settings.name) inst.tabName = Core.displayText(String(f.parsed.settings.name));
+      model(el).select = undefined;
+      rb();
+    }));
+    const move = (el, d) => { const m = model(el), i = Number(el.dataset.i); const t = m.instances[i]; m.instances.splice(i, 1); m.instances.splice(i + d, 0, t); rb(); };
+    document.querySelectorAll(".iup").forEach((el) => el.addEventListener("click", () => move(el, -1)));
+    document.querySelectorAll(".idown").forEach((el) => el.addEventListener("click", () => move(el, 1)));
+    document.querySelectorAll(".iover").forEach((el) => el.addEventListener("change", () => { const m = model(el); m.overwrite = el.checked; rebuild(); m.select = el.checked ? true : false; render(); }));
+    const target = $("target");
+    if (target) target.addEventListener("change", () => { S.opts.modelsDir = target.value === "models"; load(S.fs); });
+    const rs = $("rescan"); if (rs) rs.addEventListener("click", () => { S.opts = { modelsDir: undefined }; load(S.fs); });
+    const selected = () => convertible.filter((m) => m.select && S.built.get(m) && S.built.get(m).ok && !S.built.get(m).blockedByExisting);
+    const w = $("write");
+    if (w) w.addEventListener("click", async () => {
+      const log = [];
+      for (const m of selected()) {
+        const b = S.built.get(m);
+        try { await Scan.writeResult(S.fs, S.scan, b); log.push({ cls: "ok", text: tr("written", { p: b.path }) }); }
+        catch (e) { log.push({ cls: "warn", text: m.file + ": " + tr("writeFail", { e: e.message }) }); }
+      }
+      await load(S.fs);
+      S.log = log; render();
+    });
+    $("zip").addEventListener("click", () => {
+      const files = new Map();
+      for (const m of selected()) { const b = S.built.get(m); files.set(b.path, Core.binaryToBytes(b.text)); }
+      if (!files.size) return;
+      download(makeZip(files), "lvglMultiSwNG-config.zip");
+    });
+    $("report").addEventListener("click", () => download(new Blob([makeReport(convertible)], { type: "text/plain;charset=utf-8" }), "multiswitch-migration-report.txt"));
+  }
+
+  function makeReport(models) {
+    const out = ["MultiSwitch migration report", ""];
+    for (const m of models) {
+      out.push("== " + m.name + " (" + m.file + ")");
+      const b = S.built.get(m);
+      if (!b || !b.ok) { out.push("  not possible: " + (b ? b.messages.join(" ") : "") , ""); continue; }
+      out.push("  target: " + b.path + "  generation " + b.plan.generation + (b.plan.replaces ? " (replaces existing config)" : ""));
+      b.conv.config.tabs.forEach((t) => out.push("  tab '" + Core.displayText(t.name) + "' address " + t.address + ", " + b.conv.config.controls.filter((c) => c.tab === t.id).length + " controls"));
+      b.conv.skipped.forEach((s) => out.push("  NOT MIGRATED: " + Core.displayText(s.label) + " - " + s.reason));
+      b.messages.concat(b.conv.warnings.map((w) => "[" + w.level + "] " + w.text)).forEach((t) => out.push("  " + Core.displayText(t)));
+      out.push("");
+    }
+    return out.join("\n");
+  }
+
+  // ------------------------------------------------------------- start ---
+  function setStaticTexts() {
+    document.title = tr("title");
+    $("title").textContent = tr("title");
+    $("intro").innerHTML = tr("intro");
+    $("btnRw").textContent = tr("openRw");
+    $("btnRo").textContent = tr("openRo");
+    $("browserNote").textContent = tr("browserNote");
+    $("pickHint").textContent = tr("pickRoot");
+    $("langBtn").textContent = lang === "de" ? "English" : "Deutsch";
+  }
+
+  function init() {
+    setStaticTexts();
+    $("langBtn").addEventListener("click", () => { lang = lang === "de" ? "en" : "de"; setStaticTexts(); if (S.scan) { rebuild(); render(); } });
+    const hasFsa = typeof window.showDirectoryPicker === "function";
+    $("btnRw").disabled = !hasFsa;
+    $("btnRw").addEventListener("click", async () => {
+      try {
+        const handle = await window.showDirectoryPicker({ mode: "readwrite" });
+        let fs = FsaAdapter(handle);
+        if (!(await fs.list("MODELS")) || !(await fs.list("WIDGETS"))) {
+          // maybe a backup folder one level deeper
+          let sub = null;
+          for await (const [, h] of handle.entries()) {
+            if (h.kind !== "directory") continue;
+            const cand = FsaAdapter(h);
+            if ((await cand.list("MODELS")) && (await cand.list("WIDGETS"))) { sub = cand; break; }
+          }
+          if (!sub) { $("status").textContent = tr("noRoot"); return; }
+          fs = sub;
+        }
+        S.opts = { modelsDir: undefined };
+        await load(fs);
+      } catch (e) { if (e && e.name !== "AbortError") $("status").textContent = tr("writeFail", { e: e.message }); }
+    });
+    $("btnRo").addEventListener("click", () => $("dirInput").click());
+    $("dirInput").addEventListener("change", async () => {
+      const fs = FileListAdapter($("dirInput").files);
+      if (!fs.hasRoot()) { $("status").textContent = tr("noRoot"); return; }
+      S.opts = { modelsDir: undefined };
+      await load(fs);
+    });
+    window.__App = { load, FileListAdapter, state: S };
+  }
+  document.addEventListener("DOMContentLoaded", init);
+})();
+</script>
+</body>
+</html>
