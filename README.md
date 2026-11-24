@@ -51,10 +51,14 @@ environment. The work is split into small steps per frame to stay within EdgeTX'
 
 ## Not migrated
 
-NG has no equivalent yet; the tool reports these per button/tab:
+The tools report these per button/tab:
 
-* EdgeTX logical/virtual switches set by buttons (`external_switch`) — mixes relying on them stop working
-* virtual inputs, telemetry actions, SHM encoding, status passthrough
+* EdgeTX logical/virtual switches set by buttons (`external_switch`): newer NG versions can set local switches
+  (`Set switch`, L01..L64 Sticky / VS01..VS64). The EdgeTX script assigns them automatically when the installed NG
+  supports it (it resolves the switch index with `getSwitchName` on the radio, activates used VS switches and keeps
+  sliders, duplicates and self-feeding assignments out). The browser tool cannot resolve switch indices and only
+  reports them.
+* not supported by NG yet: virtual inputs, telemetry actions, SHM encoding, status passthrough
 * controls that violate NG rules (duplicate address/output across tabs, sliders with S.Port WM, 3Pos/sliders with ACW)
 
 Mapping notes: the CRSF destination comes from the old `commandBroadcastAddress`; the old widget option

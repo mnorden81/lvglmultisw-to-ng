@@ -340,9 +340,23 @@ local SCHEMAS = {
     },
 }
 
+-- Fields of newer NG versions; written only when the installed NG knows them.
+local OPTIONAL = {config = {virtualSwitches = 64}, control = {localSwitch = {0, 128}}}
+
 local function validateRecord(rec)
     local schema = SCHEMAS[rec.kind]
     if not schema then return "unknown record" end
+    local optional = OPTIONAL[rec.kind] or {}
+    for k, rule in pairs(optional) do
+        local v = rec[k]
+        if v ~= nil then
+            if type(rule) == "number" then
+                if type(v) ~= "string" or #v ~= rule or string.find(v, "[^01]") then return "invalid " .. rec.kind .. "." .. k end
+            elseif not (isInt(v) and v >= rule[1] and v <= rule[2]) then
+                return "invalid " .. rec.kind .. "." .. k
+            end
+        end
+    end
     for k, rule in pairs(schema) do
         local v = rec[k]
         if type(rule) == "number" then
@@ -352,7 +366,7 @@ local function validateRecord(rec)
         end
     end
     for k in pairs(rec) do
-        if k ~= "kind" and schema[k] == nil then return "unknown property " .. k end
+        if k ~= "kind" and schema[k] == nil and optional[k] == nil then return "unknown property " .. k end
     end
     return nil
 end
@@ -440,6 +454,7 @@ local function convertBegin(instances, opts)
         for k, v in pairs(override) do header[k] = v end
     end
     job.protocol = header.protocol
+    job.mapSwitch, job.usedLocal = opts.mapSwitch, {}
     job.config = {header = header, tabs = {}, controls = {}}
     job.instances, job.ti, job.bi = instances, 0, 0
     job.usedEndpoints, job.nameCount, job.controlId = {}, {}, 0
@@ -473,7 +488,7 @@ local function startTab(job)
     local count = isList(st.buttons) and #st.buttons or 0
     if isList(st.buttons) then for k in pairs(st.buttons) do if type(k) == "number" and k > count then count = k end end end
     job.count, job.bi = count, 0
-    job.extSwitch, job.virtInput = {}, {}
+    job.extSwitch, job.virtInput, job.mapped = {}, {}, {}
     if count == 0 then job.warn("warn", inst.label .. ": the old configuration contains no buttons.") end
 end
 
@@ -481,8 +496,11 @@ local function finishTab(job)
     local inst = job.instances[job.ti]
     local st = inst.settings or {}
     local warn = job.warn
+    if #job.mapped > 0 then
+        warn("info", inst.label .. ": " .. #job.mapped .. " button(s) set an EdgeTX switch ('external_switch'); now assigned to NG 'Set switch' (" .. names3(job.mapped) .. "). Logical switches L01..L64 must be Sticky in the model, as with the old widget.")
+    end
     if #job.extSwitch > 0 then
-        warn("warn", inst.label .. ": " .. #job.extSwitch .. " button(s) set an EdgeTX logical/virtual switch ('external_switch': " .. names3(job.extSwitch) .. "). NG cannot do this yet, so mixes or sounds that depend on those switches will no longer be triggered.")
+        warn("warn", inst.label .. ": " .. #job.extSwitch .. " button(s) set an EdgeTX logical/virtual switch ('external_switch': " .. names3(job.extSwitch) .. "), which was not assigned automatically. Newer NG versions can do this ('Set switch' in the control editor); assign it there, otherwise mixes or sounds that depend on those switches will no longer be triggered.")
     end
     if #job.virtInput > 0 then
         warn("warn", inst.label .. ": " .. #job.virtInput .. " button(s) set a virtual input (" .. names3(job.virtInput) .. "). NG does not support this yet.")
@@ -543,13 +561,37 @@ local function convertButton(job, bi)
         sportType = clamp(int(sp.type, 1), 0, 255), sportOptions = clamp(int(sp.options, 0), 0, 255),
         sportPwmOn = clamp(int(sp.pwm_on, 255), 0, 255),
     }
+    local ext = int(b.external_switch, 0)
+    if ext ~= 0 then
+        local target, reason
+        if ext < 0 then reason = "inverted switch"
+        elseif job.mapSwitch then target, reason = job.mapSwitch(ext)
+        else reason = nil end
+        if target and typ == 5 then target, reason = nil, "sliders cannot set a switch in NG" end
+        if target and (math.abs(rec.switch) == ext or math.abs(rec.activation) == ext or (typ == 3 and math.abs(rec.switch2) == ext)) then
+            target, reason = nil, "the switch is also this button's input"
+        end
+        if target and job.usedLocal[target] then target, reason = nil, "already set by " .. job.usedLocal[target] end
+        if target then
+            rec.localSwitch = target
+            job.usedLocal[target] = rec.name
+            local label2 = string.format(target > 64 and "VS%02d" or "L%02d", (target - 1) % 64 + 1)
+            job.mapped[#job.mapped + 1] = rec.name .. " -> " .. label2
+            if target > 64 then
+                local h = job.config.header
+                local bits = h.virtualSwitches or string.rep("0", 64)
+                h.virtualSwitches = string.sub(bits, 1, target - 65) .. "1" .. string.sub(bits, target - 63)
+            end
+        else
+            job.extSwitch[#job.extSwitch + 1] = rec.name .. (reason and (" - " .. reason) or "")
+        end
+    end
     local e = validateRecord(rec)
     if e then return skip("cannot be represented in NG (" .. e .. ")") end
     if type(b.name) == "string" and rec.name ~= b.name then
         job.warn("info", label .. ": name was shortened or cleaned to fit NG limits.")
     end
     if int(b.setVirtualInput, 0) > 0 then job.virtInput[#job.virtInput + 1] = rec.name end
-    if int(b.external_switch, 0) ~= 0 then job.extSwitch[#job.extSwitch + 1] = rec.name end
     job.config.controls[#job.config.controls + 1] = rec
     job.stats.controls = job.stats.controls + 1
 end
@@ -770,6 +812,27 @@ local function language()
 end
 
 -------------------------------------------------------------- scanning ---
+-- Old buttons stored an EdgeTX switch index (external_switch); newer NG versions take the
+-- local switch number: 1..64 = L01..L64, 65..128 = VS01..VS64.
+local function mapSwitch(index)
+    if type(getSwitchName) ~= "function" then return nil, "switch names unavailable" end
+    local ok, name = pcall(getSwitchName, index)
+    if not ok or type(name) ~= "string" then return nil, "unknown switch " .. fmtNum(index) end
+    local l = string.match(name, "^L(%d+)$")
+    if l then
+        local n = tonumber(l)
+        if n >= 1 and n <= 64 then return n end
+        return nil, name .. " is outside L01..L64"
+    end
+    local v = string.match(name, "^VS(%d+)$")
+    if v then
+        local n = tonumber(v)
+        if n >= 1 and n <= 64 then return 64 + n end
+        return nil, name .. " is outside VS01..VS64"
+    end
+    return nil, name .. " is not a logical or virtual switch"
+end
+
 -- One small piece of work per call; returns true when the scan is complete.
 local function scanStep()
     local sc = S.scan
@@ -778,6 +841,9 @@ local function scanStep()
         local appLua = readFile(NG_DIR .. "/app.lua")
         local modelsDir = appLua == nil or string.find(appLua, "modelsDir", 1, true) ~= nil
         S.targetDir = modelsDir and (NG_DIR .. "/models") or NG_DIR
+        local ngConfig = readFile(NG_DIR .. "/config.lua")
+        S.ngLocal = ngConfig ~= nil and string.find(ngConfig, "localSwitch", 1, true) ~= nil
+        ngConfig = nil
         S.files = {}
         for _, name in ipairs(listDir(OLD_DIR) or {}) do
             local base, addr = string.match(name, "^(.+)_(%d+)%.lua$")
@@ -944,7 +1010,7 @@ local function writeStep()
             local f = w.files[w.fi]
             if not f then
                 w.phase = "convert"
-                w.job = convertBegin(w.instances, {lang = S.lang, header = m.override})
+                w.job = convertBegin(w.instances, {lang = S.lang, header = m.override, mapSwitch = S.ngLocal and mapSwitch or nil})
                 return
             end
             local text, err = readFile(OLD_DIR .. "/" .. f.name, MAX_OLD_FILE)

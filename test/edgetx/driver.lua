@@ -79,6 +79,13 @@ SMLSIZE, BOLD, INVERS = 0x0100, 0x0200, 0x0400
 EVT_VIRTUAL_ENTER, EVT_VIRTUAL_EXIT, EVT_VIRTUAL_NEXT, EVT_VIRTUAL_PREV = 101, 102, 103, 104
 EVT_TOUCH_TAP, EVT_VIRTUAL_ENTER_LONG, EVT_VIRTUAL_NEXT_PAGE = 105, 106, 107
 function getGeneralSettings() return {language = "EN"} end
+-- switch indices as the old widget stored them in external_switch
+function getSwitchName(i)
+    if i >= 169 and i <= 176 then return string.format("L%02d", i - 168) end
+    if i >= 200 and i <= 231 then return string.format("L%02d", i - 190) end
+    if i >= 232 and i <= 263 then return string.format("VS%d", i - 231) end
+    return nil
+end
 collectgarbage = function() return 0 end -- not implemented in fengari
 local function screen() return table.concat(SCREEN, "\n") end
 local function has(s) return string.find(screen(), s, 1, true) ~= nil end
@@ -87,6 +94,8 @@ local function has(s) return string.find(screen(), s, 1, true) ~= nil end
 local tool = load(src("tool"), "@msw2ng.lua", "t")()
 local C = tool.core
 local NGCONFIG, NGSTORAGE = src("ngconfig"), src("ngstorage")
+local NGLOCAL = string.find(NGCONFIG, "localSwitch", 1, true) ~= nil
+results[#results + 1] = "info NG version under test: " .. (NGLOCAL and "with local switches" or "without local switches")
 
 -- EdgeTX stops a script call after a fixed number of VM instructions. The mocks above run as
 -- Lua here (C on the radio), so this budget is stricter than the radio's.
@@ -254,17 +263,27 @@ do -- list of all old configurations with their models
     goRow(ROW.convert, ROW.anna); press(EVT_VIRTUAL_ENTER)
     finish()
     local d = get(target("model01.yml", "a"))
-    check("convert: Düsseldorf identical to the browser tool", d and hex(d) == string.match(LUA_CORE[1], "^(%x+)|"), d)
+    local plain = d and string.gsub(d, ",localSwitch=%d+", "")
+    check("convert: Düsseldorf identical to the browser tool" .. (NGLOCAL and " (apart from local switches)" or ""), plain and hex(plain) == string.match(LUA_CORE[1], "^(%x+)|"), d)
+    if NGLOCAL then
+        check("local switches: L01..L07 assigned, slider left out", d and count(d, "localSwitch=") == 7 and string.find(d, "localSwitch=7,", 1, true) ~= nil and not string.find(d, "localSwitch=8,", 1, true), d)
+    else
+        check("older NG: no local switch fields written", d and not string.find(d, "localSwitch", 1, true), d)
+    end
     local k = get(target("model02.yml", "a"))
     check("convert: KARL identical to the browser tool", k and hex(k) == string.match(LUA_CORE[5], "^(%x+)|"), k)
     local b = get(target("model05.yml", "a")) or ""
     check("convert: 64-button configuration", count(b, 'kind="control"') == 64, b)
+    if NGLOCAL then
+        check("local switches: VS targets activate virtual switches in the header", count(b, "localSwitch=") == 22
+            and string.find(b, "virtualSwitches=\"" .. string.rep("010", 10) .. "01" .. string.rep("0", 32) .. "\"", 1, true) ~= nil, b)
+    end
     check("convert: unchecked Anna not written", get(target("model03.yml", "a")) == nil)
     local rep = reportText()
     local okCount = 0
     for _, r in ipairs(tool.state().reports) do if r.check == "ok" then okCount = okCount + 1 end end
     check("convert: NG loader check OK for all models", okCount == 3 and #tool.state().reports == 3, rep)
-    check("report: logical switches and skipped buttons", string.find(rep, "external_switch", 1, true) and string.find(rep, "already used by", 1, true), rep)
+    check("report: switches and skipped buttons", string.find(rep, NGLOCAL and "Set switch" or "external_switch", 1, true) and string.find(rep, "already used by", 1, true), rep)
     check("old files and model files unchanged", get(OLD .. "Düsseldorf_0.lua") == FIX[0].files["Düsseldorf_0.lua"] and get("/MODELS/model01.yml") == FIX[0].yaml)
     check("EXIT ends the tool", call(EVT_VIRTUAL_EXIT) == 1)
 end

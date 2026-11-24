@@ -454,7 +454,7 @@
 
       const names3 = (a) => a.slice(0, 3).map((n) => displayText(n)).join(", ") + (a.length > 3 ? ", ..." : "");
       if (extSwitch.length)
-        warn("warn", inst.label + ": " + extSwitch.length + " button(s) set an EdgeTX logical/virtual switch ('external_switch': " + names3(extSwitch) + "). NG cannot do this yet, so mixes or sounds that depend on those switches will no longer be triggered.");
+        warn("warn", inst.label + ": " + extSwitch.length + " button(s) set an EdgeTX logical/virtual switch ('external_switch': " + names3(extSwitch) + "). They are not assigned automatically here: assign them in NG (control editor, 'Set switch', newer NG versions) or convert on the radio with the EdgeTX tool script, which does it automatically. Otherwise mixes or sounds that depend on those switches will no longer be triggered.");
       if (virtInput.length)
         warn("warn", inst.label + ": " + virtInput.length + " button(s) set a virtual input (" + names3(virtInput) + "). NG does not support this yet.");
       // unsupported features at widget level
