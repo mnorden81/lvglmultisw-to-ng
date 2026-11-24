@@ -1,0 +1,56 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>msw2ng.lua tests</title>
+<!-- Built by test/edgetx/build.sh. Runs the EdgeTX tool script with fengari (Lua 5.3 in JS)
+     against an in-memory SD card, compares its output byte for byte with src/core.js and
+     loads the result with the real config.lua/storage.lua of lvglMultiSwNG. -->
+<script src="https://cdn.jsdelivr.net/npm/fengari-web@0.1.4/dist/fengari-web.js"></script>
+<script type="text/plain" id="tool">/*__TOOL__*/</script>
+<script type="text/plain" id="ngconfig">/*__NGCONFIG__*/</script>
+<script type="text/plain" id="ngstorage">/*__NGSTORAGE__*/</script>
+<script type="text/plain" id="driver">/*__DRIVER__*/</script>
+<script>/*__CORE__*/</script>
+<script>/*__FIXTURES__*/</script>
+<pre id="out">running ...</pre>
+<script>
+(function () {
+  const out = [];
+  const bin = (s) => unescape(encodeURIComponent(s));
+  function jsRun(fx) {
+    const yaml = Core.parseYaml(bin(fx.yaml));
+    const widgets = Core.findWidgets(yaml);
+    const byAddress = new Map();
+    widgets.filter((w) => w.kind === "old").forEach((w) => { if (!byAddress.has(w.options.Address)) byAddress.set(w.options.Address, w); });
+    const insts = [];
+    [...byAddress.values()].sort((a, b) => a.options.Address - b.options.Address).forEach((w) => {
+      const wanted = (fx.modelName + "_" + w.options.Address + ".lua").toLowerCase();
+      Object.keys(fx.files).forEach((name) => {
+        if (name.toLowerCase() !== wanted) return;
+        const st = Core.parseOldConfig(bin(fx.files[name]));
+        insts.push({ address: w.options.Address, options: w.options, settings: st, tabName: st.name,
+          label: "Address " + w.options.Address + " (" + bin(name) + ")" });
+      });
+    });
+    const r = Core.convert(insts, { lang: "en" });
+    return Core.toHex(Core.ngFileText(r.config, 1)) + "|" + r.warnings.length + "|" + r.skipped.length + "|" + widgets.length;
+  }
+  try {
+    fengari.load(document.getElementById("driver").textContent, "driver.lua")();
+    const lua = String(window.LUA_CORE).split("\n");
+    window.FIX.forEach((fx, i) => {
+      let js;
+      try { js = jsRun(fx); } catch (e) { js = "ERROR " + e.message; }
+      const ok = js === lua[i];
+      out.push((ok ? "ok   " : "FAIL ") + "same NG file as the browser tool: " + fx.name + (ok ? "" : "\n   js : " + js.slice(-80) + "\n   lua: " + (lua[i] || "").slice(-80)));
+    });
+    out.push(String(window.LUA_RESULTS));
+  } catch (e) {
+    out.push("FAIL driver crashed: " + (e && e.stack || e));
+  }
+  const text = out.join("\n");
+  const fails = (text.match(/^FAIL/gm) || []).length;
+  const oks = (text.match(/^ok/gm) || []).length;
+  document.getElementById("out").textContent = text + "\n\n" + oks + " passed, " + fails + " failed";
+  document.title = fails ? "FAILED" : "PASSED";
+})();
+</script>
